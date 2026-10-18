@@ -26,6 +26,26 @@ upstream release tuple, staging evidence, and rollback manifest must be validate
 The production Telegram Agent drop-in must retain `KillMode=process` so its restart
 does not recursively destroy qualified tmux/wrapper/Codex processes.
 
+Keep the Telegram bot token and instance-specific dispatch configuration in a
+service-owned file outside every source checkout, for example
+`~/.config/ai-agent-runtime/secrets/agent_01-telegram.env`, with directory mode
+`0700` and file mode `0600`. The Runtime dispatch guard is enabled only when the
+file supplies all three identity values:
+
+```dotenv
+AI_AGENT_RUNTIME_SOCKET=/run/user/1000/ai-agent-runtime/agent_01/runtime.sock
+AI_AGENT_RUNTIME_AGENT_INSTANCE_ID=agent_01
+AI_AGENT_RUNTIME_CHAT_ID=-1000000000000
+AI_AGENT_RUNTIME_DISPATCH_WAIT_SEC=21600
+```
+
+The first three values are an all-or-nothing contract; the wait value is optional.
+Add the bot's normal environment to the same private file, point the Telegram
+service's `EnvironmentFile=` at it, run `systemctl --user daemon-reload`, and restart
+only that Telegram service after changing the file. Never copy the real file into a
+release or repository. The checked-in drop-in uses neutral example identifiers and
+must be rendered for the target AgentInstance before deployment.
+
 For the optional transcript projection, create an owned private directory for
 `[telegram_agent] sessions_view_root` and give that AgentInstance's upstream
 service a separate `HOME` whose `.codex/sessions` resolves to this view. Keep
