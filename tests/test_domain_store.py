@@ -42,6 +42,60 @@ def test_control_plane_sync_timestamp_is_durable(tmp_path: Path) -> None:
     reopened.close()
 
 
+def test_dispatch_state_distinguishes_launch_and_applied_desire(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite")
+    binding = RuntimeBinding(
+        binding_id="binding-1",
+        agent_instance_id="agent-1",
+        chat_id=-1001,
+        thread_id=42,
+        project_id="project-1",
+        canonical_cwd="/srv/project",
+        expected_tmux_session="cc-n1001-42",
+    )
+    store.upsert_binding(binding)
+    first = _spec()
+    store.put_effective_spec(first, codex_home=tmp_path, profile_fingerprint="fp")
+    store.record_instance(
+        instance_id="instance-1",
+        binding_id=binding.binding_id,
+        wrapper_pid=100,
+        wrapper_starttime=10,
+        child_pid=101,
+        child_starttime=11,
+        tmux_session=binding.expected_tmux_session,
+        tmux_pane="%1",
+        lifecycle="IDLE",
+        applied_digest=None,
+        launch_spec={"desired": {"spec_digest": first.spec_digest}},
+    )
+
+    launched = store.dispatch_state(agent_instance_id="agent-1", chat_id=-1001, thread_id=42)
+    assert launched is not None
+    assert launched.live_instance_count == 1
+    assert launched.launch_spec_digest == first.spec_digest
+    assert launched.applied_spec_digest is None
+
+    store.record_applied_spec(
+        instance_id="instance-1",
+        binding_id=binding.binding_id,
+        spec=first,
+        evidence={"verified": True},
+        session_id="session-1",
+        account_profile="work",
+        rollout_path="/rollout",
+        rollout_device=1,
+        rollout_inode=2,
+    )
+    second = _spec(2)
+    store.put_effective_spec(second, codex_home=tmp_path, profile_fingerprint="fp")
+
+    pending = store.dispatch_state(agent_instance_id="agent-1", chat_id=-1001, thread_id=42)
+    assert pending is not None
+    assert pending.desired_spec_digest == second.spec_digest
+    assert pending.applied_spec_digest == first.spec_digest
+
+
 def test_store_rejects_revision_rollback_and_conflicting_digest(tmp_path: Path) -> None:
     store = RuntimeStore(tmp_path / "runtime.sqlite")
     store.upsert_binding(

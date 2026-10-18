@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass
 from enum import StrEnum
@@ -36,10 +37,61 @@ class RolloutScan:
     next_offset: int
     signals: tuple[RolloutSignal, ...]
     at_eof: bool
+    skipped_oversized_records: int = 0
 
 
 class RolloutContractError(ValueError):
     pass
+
+
+_OUTER_TYPE = re.compile(rb'"type"\s*:\s*"([^"\\]+)"')
+_SIGNAL_RECORD_TYPES = frozenset({b"event_msg", b"turn_context"})
+_LIFECYCLE_EVENT_TYPES = frozenset(
+    {b"task_started", b"turn_started", b"task_complete", b"turn_complete"}
+)
+_TYPE_PREFIX_BYTES = 8192
+
+
+def _oversized_record_is_ignorable(prefix: bytes) -> bool:
+    """Classify a qualified Codex record without retaining its large payload.
+
+    Codex 0.156.1 emits the top-level ``type`` before ``payload``. Lifecycle
+    evidence lives only in ``event_msg`` and ``turn_context`` records, both of
+    which are bounded metadata records. Large response/tool records may contain
+    arbitrary user data and are intentionally skipped rather than decoded.
+    """
+
+    matches = tuple(_OUTER_TYPE.finditer(prefix[:_TYPE_PREFIX_BYTES]))
+    if not matches:
+        raise RolloutContractError("oversized rollout record lacks a bounded outer type")
+    outer_type = matches[0].group(1)
+    if outer_type not in _SIGNAL_RECORD_TYPES:
+        return True
+    if outer_type == b"turn_context":
+        return False
+    if len(matches) < 2:
+        raise RolloutContractError("oversized event record lacks a bounded event type")
+    return matches[1].group(1) not in _LIFECYCLE_EVENT_TYPES
+
+
+def _skip_oversized_record(fd: int, initial: bytes, *, max_bytes: int) -> tuple[int, bool]:
+    """Return bytes through the record newline, using bounded memory.
+
+    A missing newline means the writer has not completed the record yet; in
+    that case the caller must retain its previous durable cursor.
+    """
+
+    if not _oversized_record_is_ignorable(initial):
+        raise RolloutContractError("qualified lifecycle record exceeds maximum size")
+    consumed = len(initial)
+    while True:
+        chunk = os.read(fd, max_bytes)
+        newline = chunk.find(b"\n")
+        if newline >= 0:
+            return consumed + newline + 1, True
+        consumed += len(chunk)
+        if not chunk:
+            return consumed, False
 
 
 def scan_rollout(
@@ -73,6 +125,25 @@ def scan_rollout(
         os.lseek(fd, start_offset, os.SEEK_SET)
         chunk = os.read(fd, max_bytes)
         file_size = metadata.st_size
+        if b"\n" not in chunk and len(chunk) > max_line_bytes:
+            skipped_length, complete = _skip_oversized_record(
+                fd,
+                chunk,
+                max_bytes=max_bytes,
+            )
+            if not complete:
+                return RolloutScan(
+                    next_offset=start_offset,
+                    signals=(),
+                    at_eof=True,
+                )
+            next_offset = start_offset + skipped_length
+            return RolloutScan(
+                next_offset=next_offset,
+                signals=(),
+                at_eof=next_offset >= file_size,
+                skipped_oversized_records=1,
+            )
     finally:
         os.close(fd)
     complete_length = chunk.rfind(b"\n") + 1
@@ -87,10 +158,14 @@ def scan_rollout(
 
     signals: list[RolloutSignal] = []
     consumed = 0
+    skipped_oversized_records = 0
     for raw_line in chunk[:complete_length].splitlines(keepends=True):
         consumed += len(raw_line)
         if len(raw_line) > max_line_bytes:
-            raise RolloutContractError("rollout line exceeds maximum size")
+            if not _oversized_record_is_ignorable(raw_line):
+                raise RolloutContractError("qualified lifecycle record exceeds maximum size")
+            skipped_oversized_records += 1
+            continue
         try:
             record = json.loads(raw_line)
         except json.JSONDecodeError as exc:
@@ -102,6 +177,7 @@ def scan_rollout(
         next_offset=start_offset + complete_length,
         signals=tuple(signals),
         at_eof=start_offset + complete_length >= file_size,
+        skipped_oversized_records=skipped_oversized_records,
     )
 
 

@@ -267,6 +267,18 @@ class RegisteredInstance:
 
 
 @dataclass(frozen=True, slots=True)
+class DispatchState:
+    binding: RuntimeBinding
+    desired_spec_digest: str | None
+    desired_provider: str | None
+    desired_model: str | None
+    live_instance_count: int
+    lifecycle: str | None
+    applied_spec_digest: str | None
+    launch_spec_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ObservedSpecProposal:
     binding_id: str
     base_generation_id: str

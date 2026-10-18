@@ -8,7 +8,7 @@ import struct
 from typing import Any
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 0
+PROTOCOL_MINOR = 1
 MAX_FRAME_SIZE = 1024 * 1024
 _HEADER = struct.Struct("!I")
 

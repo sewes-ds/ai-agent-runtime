@@ -14,7 +14,7 @@ own 2-second outer deadline.
 Successful mutating responses are stored durably with a digest of the request. A
 retry using the same ID and payload returns the original outcome, including after a
 daemon restart. Reusing an ID with a different payload is rejected.
-`heartbeat`, `control_plane_heartbeat`, `status`, and `outbox_pull` use only
+`heartbeat`, `control_plane_heartbeat`, `status`, `prepare_dispatch`, and `outbox_pull` use only
 the daemon's bounded in-memory cache; their responses are not appended to the
 durable idempotency table on every poll. After a daemon restart, replaying one
 may refresh the lease, return a newer status snapshot, or re-read an outbox
@@ -38,6 +38,15 @@ Unknown binding, unverified resume provenance, config drift, ambiguous identity,
 Codex subprocess mode fail closed.
 
 ## Control-plane action
+
+`prepare_dispatch` is the prompt-free, same-user pre-dispatch barrier used by
+the qualified Telegram adapter. It accepts only AgentInstance/chat/thread
+identity and returns `ALLOW`, `START_REQUIRED`, `WAIT`, or
+`RECYCLE_REQUIRED`. A live process whose applied or launch-authorized digest
+differs from current desired state can never receive a new prompt: BUSY waits,
+IDLE recycles, and ambiguous or unmanaged state fails closed. Prompt content is
+not part of this protocol. Successful decisions include the provider/model
+identity the adapter must use when it starts or recycles the local session.
 
 `apply_binding` accepts a binding identity and complete DesiredSpec. Before touching
 Telegram Agent configuration, Runtime verifies:

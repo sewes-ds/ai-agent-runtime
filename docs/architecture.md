@@ -77,6 +77,10 @@ contain model and effort. Runtime scans owned rollout files by device/inode and 
 byte offset, retains metadata only, and writes an idempotent observed proposal to the
 outbox when the proven settings differ from local desired state. Ordinary transcript
 text, Telegram commands, picker screens, and output silence never become evidence.
+Oversized non-lifecycle records are classified from a bounded version-qualified
+prefix and skipped to their newline with bounded memory; the durable cursor must
+advance past them before later lifecycle evidence is interpreted. Oversized or
+unclassifiable lifecycle records fail closed.
 
 The same durable transaction records a binding-scoped local LKG overlay for the
 proven model/reasoning. While its proposal awaits CUS, new launches of that binding

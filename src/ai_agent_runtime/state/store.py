@@ -12,6 +12,7 @@ from typing import Any, cast
 
 from ai_agent_runtime.domain import (
     DesiredSpec,
+    DispatchState,
     ManagementMode,
     ObservedSpecProposal,
     PendingEvidenceInstance,
@@ -147,6 +148,7 @@ _INSTANCE_HEARTBEAT_STALE_SECONDS = 10.0
 
 _PUBLIC_APPLIED_EVIDENCE_FIELDS = frozenset(
     {
+        "provider",
         "account_profile",
         "actual_codex_home",
         "actual_model",
@@ -190,6 +192,12 @@ def _applied_status(row: sqlite3.Row) -> dict[str, object] | None:
                 for key, value in decoded.items()
                 if key in _PUBLIC_APPLIED_EVIDENCE_FIELDS
             }
+    if "provider" not in evidence and isinstance(row["launch_spec_json"], str):
+        launch = json.loads(row["launch_spec_json"])
+        desired = launch.get("desired") if isinstance(launch, dict) else None
+        provider = desired.get("provider") if isinstance(desired, dict) else None
+        if isinstance(provider, str) and provider:
+            evidence["provider"] = provider
     return {
         "generation_id": row["applied_generation"],
         "revision": row["applied_revision"],
@@ -363,6 +371,89 @@ class RuntimeStore:
             configured=bool(row["configured"]),
             config_digest=row["config_digest"],
             management_mode=ManagementMode(row["management_mode"]),
+        )
+
+    def dispatch_state(
+        self,
+        *,
+        agent_instance_id: str,
+        chat_id: int,
+        thread_id: int,
+    ) -> DispatchState | None:
+        binding_row = self._connection.execute(
+            """
+            SELECT * FROM bindings
+            WHERE agent_instance_id=? AND chat_id=? AND thread_id=?
+            """,
+            (agent_instance_id, chat_id, thread_id),
+        ).fetchone()
+        if binding_row is None:
+            return None
+        binding = RuntimeBinding(
+            binding_id=binding_row["binding_id"],
+            agent_instance_id=binding_row["agent_instance_id"],
+            chat_id=binding_row["chat_id"],
+            thread_id=binding_row["thread_id"],
+            project_id=binding_row["project_id"],
+            canonical_cwd=binding_row["canonical_cwd"],
+            expected_tmux_session=binding_row["expected_tmux_session"],
+            configured=bool(binding_row["configured"]),
+            config_digest=binding_row["config_digest"],
+            management_mode=ManagementMode(binding_row["management_mode"]),
+        )
+        desired_row = self._connection.execute(
+            "SELECT spec_digest, payload_json FROM effective_specs WHERE binding_id=?",
+            (binding.binding_id,),
+        ).fetchone()
+        desired_payload = (
+            json.loads(desired_row["payload_json"]) if desired_row is not None else None
+        )
+        if desired_payload is not None and not isinstance(desired_payload, dict):
+            raise ValueError("persisted effective spec payload is invalid")
+        live_rows = self._connection.execute(
+            """
+            SELECT i.lifecycle, i.launch_spec_json,
+                   a.spec_digest AS applied_spec_digest
+            FROM instances AS i
+            LEFT JOIN applied_specs AS a ON a.instance_id=i.instance_id
+            WHERE i.binding_id=?
+              AND i.lifecycle NOT IN ('EXITED', 'RETIRED_FOR_RESTART', 'START_FAILED')
+            ORDER BY i.updated_at DESC, i.instance_id
+            """,
+            (binding.binding_id,),
+        ).fetchall()
+        sole = live_rows[0] if len(live_rows) == 1 else None
+        launch_spec_digest: str | None = None
+        if sole is not None and sole["launch_spec_json"] is not None:
+            launch_spec = json.loads(sole["launch_spec_json"])
+            desired = launch_spec.get("desired") if isinstance(launch_spec, dict) else None
+            if isinstance(desired, dict) and isinstance(desired.get("spec_digest"), str):
+                launch_spec_digest = str(desired["spec_digest"])
+        return DispatchState(
+            binding=binding,
+            desired_spec_digest=(
+                str(desired_row["spec_digest"]) if desired_row is not None else None
+            ),
+            desired_provider=(
+                str(desired_payload["provider"])
+                if desired_payload is not None
+                and isinstance(desired_payload.get("provider"), str)
+                else None
+            ),
+            desired_model=(
+                str(desired_payload["model"])
+                if desired_payload is not None
+                and isinstance(desired_payload.get("model"), str)
+                else None
+            ),
+            live_instance_count=len(live_rows),
+            lifecycle=str(sole["lifecycle"]) if sole is not None else None,
+            applied_spec_digest=(
+                str(sole["applied_spec_digest"])
+                if sole is not None and sole["applied_spec_digest"] is not None
+                else None
+            ),
+            launch_spec_digest=launch_spec_digest,
         )
 
     def live_binding_ids(self, binding_ids: frozenset[str]) -> frozenset[str]:
@@ -1261,6 +1352,7 @@ class RuntimeStore:
     ) -> None:
         normalized_evidence = dict(evidence)
         normalized_evidence.setdefault("spec_digest", spec.spec_digest)
+        normalized_evidence.setdefault("provider", spec.provider)
         normalized_evidence.setdefault("account_profile", spec.account_profile)
         normalized_evidence.setdefault("actual_model", spec.model)
         normalized_evidence.setdefault("actual_reasoning_effort", spec.reasoning_effort)

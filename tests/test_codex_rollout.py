@@ -142,3 +142,122 @@ def test_rollout_parser_rejects_symlink(tmp_path: Path) -> None:
             expected_inode=metadata.st_ino,
         )
     assert os.path.islink(link)
+
+
+def test_rollout_parser_skips_oversized_response_and_reaches_task_complete(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rollout.jsonl"
+    _append(
+        path,
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t1"},
+        },
+    )
+    _append(
+        path,
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "output": "x" * (3 * 1024 * 1024)},
+        },
+    )
+    _append(
+        path,
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1"},
+        },
+    )
+    metadata = path.stat()
+
+    result = scan_rollout(
+        path,
+        codex_version="codex-cli 0.156.1",
+        start_offset=0,
+        expected_device=metadata.st_dev,
+        expected_inode=metadata.st_ino,
+    )
+
+    assert result.next_offset == metadata.st_size
+    assert result.at_eof is True
+    assert result.skipped_oversized_records == 1
+    assert [signal.kind for signal in result.signals] == [
+        RolloutSignalKind.TURN_STARTED,
+        RolloutSignalKind.TURN_COMPLETED,
+    ]
+
+
+def test_rollout_parser_skips_oversized_response_larger_than_scan_window(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rollout.jsonl"
+    _append(
+        path,
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "output": "x" * (5 * 1024 * 1024)},
+        },
+    )
+    _append(
+        path,
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1"},
+        },
+    )
+    metadata = path.stat()
+
+    first = scan_rollout(
+        path,
+        codex_version="codex-cli 0.156.1",
+        start_offset=0,
+        expected_device=metadata.st_dev,
+        expected_inode=metadata.st_ino,
+    )
+    second = scan_rollout(
+        path,
+        codex_version="codex-cli 0.156.1",
+        start_offset=first.next_offset,
+        expected_device=metadata.st_dev,
+        expected_inode=metadata.st_ino,
+    )
+
+    assert first.skipped_oversized_records == 1
+    assert first.next_offset < metadata.st_size
+    assert [signal.kind for signal in second.signals] == [RolloutSignalKind.TURN_COMPLETED]
+    assert second.next_offset == metadata.st_size
+
+
+def test_rollout_parser_skips_oversized_non_lifecycle_event(tmp_path: Path) -> None:
+    path = tmp_path / "rollout.jsonl"
+    _append(
+        path,
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": "t1",
+                "item": {"output": "x" * (3 * 1024 * 1024)},
+            },
+        },
+    )
+    _append(
+        path,
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1"},
+        },
+    )
+    metadata = path.stat()
+
+    result = scan_rollout(
+        path,
+        codex_version="codex-cli 0.156.1",
+        start_offset=0,
+        expected_device=metadata.st_dev,
+        expected_inode=metadata.st_ino,
+    )
+
+    assert result.skipped_oversized_records == 1
+    assert [signal.kind for signal in result.signals] == [RolloutSignalKind.TURN_COMPLETED]

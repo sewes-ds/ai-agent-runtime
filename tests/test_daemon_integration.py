@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,103 @@ from ai_agent_runtime.ipc.protocol import versioned
 from ai_agent_runtime.process_safety import proc_starttime, profile_fingerprint
 from ai_agent_runtime.telegram_upstream import topic_config as topic_config_adapter
 from ai_agent_runtime.telegram_upstream.topic_config import read_topic_config
+
+
+def test_prepare_dispatch_blocks_old_model_until_idle_recycle(tmp_path: Path) -> None:
+    config = replace(
+        RuntimeConfig.defaults(),
+        agent_instance_id="agent-1",
+        forum_chat_id=-1001,
+        state_dir=tmp_path / "state",
+        database_path=tmp_path / "state/runtime.sqlite",
+        socket_path=tmp_path / "run/runtime.sock",
+    )
+    daemon = RuntimeServer(config)
+    binding = RuntimeBinding(
+        binding_id="binding-1",
+        agent_instance_id="agent-1",
+        chat_id=-1001,
+        thread_id=42,
+        project_id="project-1",
+        canonical_cwd="/srv/project",
+        expected_tmux_session="cc-n1001-42",
+    )
+    daemon.store.upsert_binding(binding)
+    first = DesiredSpec.build(
+        binding_id=binding.binding_id,
+        agent_instance_id=binding.agent_instance_id,
+        project_id=binding.project_id,
+        canonical_cwd=binding.canonical_cwd,
+        provider="codex",
+        account_profile="work",
+        model="gpt-old",
+        reasoning_effort="high",
+        generation_id="gen-1",
+        revision=1,
+    )
+    daemon.store.put_effective_spec(first, codex_home=tmp_path, profile_fingerprint="fp")
+    payload = {"agent_instance_id": "agent-1", "chat_id": -1001, "thread_id": 42}
+
+    stopped = daemon._prepare_dispatch("stopped", payload)
+    assert stopped["decision"] == "START_REQUIRED"
+    assert stopped["desired"] == {"provider": "codex", "model": "gpt-old"}
+
+    daemon.store.record_instance(
+        instance_id="instance-1",
+        binding_id=binding.binding_id,
+        wrapper_pid=100,
+        wrapper_starttime=10,
+        child_pid=101,
+        child_starttime=11,
+        tmux_session=binding.expected_tmux_session,
+        tmux_pane="%1",
+        lifecycle="BUSY",
+        applied_digest=first.spec_digest,
+        launch_spec={"desired": {"spec_digest": first.spec_digest}},
+    )
+    daemon.store.record_applied_spec(
+        instance_id="instance-1",
+        binding_id=binding.binding_id,
+        spec=first,
+        evidence={"verified": True},
+        session_id="session-1",
+        account_profile="work",
+        rollout_path="/rollout",
+        rollout_device=1,
+        rollout_inode=2,
+    )
+    assert daemon._prepare_dispatch("matching", payload)["decision"] == "ALLOW"
+
+    second = DesiredSpec.build(
+        binding_id=binding.binding_id,
+        agent_instance_id=binding.agent_instance_id,
+        project_id=binding.project_id,
+        canonical_cwd=binding.canonical_cwd,
+        provider="codex",
+        account_profile="work",
+        model="gpt-new",
+        reasoning_effort="xhigh",
+        generation_id="gen-1",
+        revision=2,
+    )
+    daemon.store.put_effective_spec(second, codex_home=tmp_path, profile_fingerprint="fp")
+    assert daemon._prepare_dispatch("busy", payload)["decision"] == "WAIT"
+
+    daemon.store.record_instance(
+        instance_id="instance-1",
+        binding_id=binding.binding_id,
+        wrapper_pid=100,
+        wrapper_starttime=10,
+        child_pid=101,
+        child_starttime=11,
+        tmux_session=binding.expected_tmux_session,
+        tmux_pane="%1",
+        lifecycle="IDLE",
+        applied_digest=first.spec_digest,
+    )
+    idle = daemon._prepare_dispatch("idle", payload)
+    assert idle["decision"] == "RECYCLE_REQUIRED"
+    assert idle["desired"] == {"provider": "codex", "model": "gpt-new"}
 
 
 @pytest.mark.usefixtures("allow_hosted_runner_python")
@@ -43,9 +141,7 @@ async def test_clear_waits_for_new_upstream_state(
         ),
         encoding="utf-8",
     )
-    tmux_name = (
-        "cc-n1001-42-switch-18dba53c902bb319" if switched_name else "cc-n1001-42"
-    )
+    tmux_name = "cc-n1001-42-switch-18dba53c902bb319" if switched_name else "cc-n1001-42"
     tmux_state = tmp_path / "tmux_state.json"
 
     def write_state(session_id: str | None) -> None:

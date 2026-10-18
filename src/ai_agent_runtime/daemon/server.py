@@ -215,6 +215,7 @@ class RuntimeServer:
         self.evidence_interval = evidence_interval
         self._results: OrderedDict[str, tuple[str, dict[str, Any]]] = OrderedDict()
         self._session_view_error: str | None = None
+        self._rollout_observer_faults: set[str] = set()
 
     async def serve(self) -> None:
         self._refresh_effective_profile_attestations_once()
@@ -337,6 +338,8 @@ class RuntimeServer:
                 response = self._control_plane_heartbeat(request_id, payload)
             elif action == "status":
                 response = self._status(request_id)
+            elif action == "prepare_dispatch":
+                response = self._prepare_dispatch(request_id, payload)
             elif action == "apply_binding":
                 response = self._apply_binding(request_id, payload)
             elif action == "apply_snapshot":
@@ -366,7 +369,13 @@ class RuntimeServer:
                 request_digest,
                 response,
                 durable=action
-                not in {"heartbeat", "control_plane_heartbeat", "status", "outbox_pull"},
+                not in {
+                    "heartbeat",
+                    "control_plane_heartbeat",
+                    "status",
+                    "prepare_dispatch",
+                    "outbox_pull",
+                },
             )
             await write_frame(writer, response)
         except (ConnectionError, TimeoutError, asyncio.IncompleteReadError):
@@ -1634,6 +1643,99 @@ class RuntimeServer:
         }
         return self._ok(request_id, status=report)
 
+    def _prepare_dispatch(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Gate one topic prompt against authoritative desired/applied state."""
+
+        agent_instance_id = _required_str(payload, "agent_instance_id")
+        if agent_instance_id != self.config.agent_instance_id:
+            raise RuntimeFailureError(ErrorCode.UNKNOWN_BINDING, "AgentInstance mismatch")
+        chat_id = _required_int(payload, "chat_id")
+        thread_id = _required_int(payload, "thread_id")
+        if chat_id != self.config.forum_chat_id:
+            raise RuntimeFailureError(ErrorCode.UNKNOWN_BINDING, "forum chat mismatch")
+        state = self.store.dispatch_state(
+            agent_instance_id=agent_instance_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if state is None or not state.binding.configured:
+            raise RuntimeFailureError(ErrorCode.UNKNOWN_BINDING, "topic binding is not configured")
+        if state.binding.management_mode is not ManagementMode.MANAGED:
+            raise RuntimeFailureError(
+                ErrorCode.CONFIG_DRIFT,
+                f"topic binding is not managed: {state.binding.management_mode.value}",
+            )
+        if state.desired_spec_digest is None:
+            raise RuntimeFailureError(ErrorCode.UNKNOWN_BINDING, "binding has no desired spec")
+        if state.desired_provider is None or state.desired_model is None:
+            raise RuntimeFailureError(ErrorCode.CONFIG_DRIFT, "desired spec identity is incomplete")
+        desired_identity = {
+            "provider": state.desired_provider,
+            "model": state.desired_model,
+        }
+        if state.live_instance_count == 0:
+            return self._ok(
+                request_id,
+                decision="START_REQUIRED",
+                binding_id=state.binding.binding_id,
+                desired_spec_digest=state.desired_spec_digest,
+                desired=desired_identity,
+            )
+        if state.live_instance_count != 1:
+            return self._ok(
+                request_id,
+                decision="DENY",
+                reason="AMBIGUOUS_LIVE_INSTANCES",
+                binding_id=state.binding.binding_id,
+            )
+        effective_digest = state.applied_spec_digest or state.launch_spec_digest
+        if effective_digest == state.desired_spec_digest:
+            return self._ok(
+                request_id,
+                decision="ALLOW",
+                binding_id=state.binding.binding_id,
+                lifecycle=state.lifecycle,
+                desired_spec_digest=state.desired_spec_digest,
+                desired=desired_identity,
+            )
+        if state.lifecycle == LifecycleState.BUSY:
+            return self._ok(
+                request_id,
+                decision="WAIT",
+                reason="ACTIVE_TURN_USES_PREVIOUS_SPEC",
+                retry_after_ms=500,
+                binding_id=state.binding.binding_id,
+                desired=desired_identity,
+            )
+        if state.lifecycle == LifecycleState.IDLE:
+            return self._ok(
+                request_id,
+                decision="RECYCLE_REQUIRED",
+                reason="IDLE_INSTANCE_USES_PREVIOUS_SPEC",
+                binding_id=state.binding.binding_id,
+                desired=desired_identity,
+            )
+        if state.lifecycle == LifecycleState.PROVISIONAL_STARTING:
+            return self._ok(
+                request_id,
+                decision="WAIT",
+                reason="INSTANCE_STARTING",
+                retry_after_ms=250,
+                binding_id=state.binding.binding_id,
+                desired=desired_identity,
+            )
+        return self._ok(
+            request_id,
+            decision="DENY",
+            reason="UNSAFE_INSTANCE_STATE",
+            binding_id=state.binding.binding_id,
+            lifecycle=state.lifecycle,
+        )
+
     def _project_session_view_once(self) -> None:
         view_root = self.config.sessions_view_root
         if view_root is None:
@@ -1892,8 +1994,17 @@ class RuntimeServer:
     async def _observe_codex_rollouts_loop(self) -> None:
         while True:
             for target in self.store.rollout_observation_targets():
-                with contextlib.suppress(OSError, ValueError, RolloutContractError):
+                try:
                     self._observe_codex_rollout(target)
+                    self._rollout_observer_faults.discard(target.instance_id)
+                except (OSError, ValueError, RolloutContractError) as exc:
+                    if target.instance_id not in self._rollout_observer_faults:
+                        logger.error(
+                            "Codex rollout observer blocked for instance %s: %s",
+                            target.instance_id,
+                            exc,
+                        )
+                        self._rollout_observer_faults.add(target.instance_id)
             await asyncio.sleep(self.evidence_interval)
 
     async def _retire_pending_loop(self) -> None:
@@ -1949,6 +2060,12 @@ class RuntimeServer:
             expected_device=target.rollout_device,
             expected_inode=target.rollout_inode,
         )
+        if scanned.skipped_oversized_records:
+            logger.warning(
+                "Skipped %d oversized non-lifecycle Codex rollout record(s) for instance %s",
+                scanned.skipped_oversized_records,
+                target.instance_id,
+            )
         lifecycle = target.lifecycle
         active_turn_id = cursor.active_turn_id
         pending_model = cursor.pending_model
