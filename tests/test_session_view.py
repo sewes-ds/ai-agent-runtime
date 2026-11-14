@@ -211,3 +211,66 @@ def test_daemon_projects_new_rollouts_for_configured_binding(tmp_path: Path) -> 
     assert (view / "2026/10/05" / second.name).resolve() == second
     assert server._status("request-1")["status"]["session_view"]["error"] is None
     server.store.close()
+
+
+def test_daemon_session_view_ignores_non_codex_provider_profiles(tmp_path: Path) -> None:
+    profiles = tmp_path / "profiles"
+    profiles.mkdir(mode=0o700)
+    credential = tmp_path / "credentials" / "deepseek.token"
+    credential.parent.mkdir(mode=0o700)
+    credential.write_text("secret-for-test\n", encoding="utf-8")
+    credential.chmod(0o600)
+    view = tmp_path / "view"
+    view.mkdir(mode=0o700)
+    config = RuntimeConfig(
+        agent_instance_id="agent-1",
+        forum_chat_id=-1001,
+        state_dir=tmp_path / "state",
+        socket_path=tmp_path / "run" / "runtime.sock",
+        database_path=tmp_path / "state" / "runtime.sqlite",
+        real_codex=tmp_path / "codex-real",
+        real_codex_version="test",
+        real_codex_sha256="sha256:" + "0" * 64,
+        profiles_root=profiles,
+        topic_config_path=tmp_path / "topics.json",
+        tmux_state_path=tmp_path / "tmux-state.json",
+        upstream_sha="0" * 40,
+        deepseek_api_key_path=credential,
+        sessions_view_root=view,
+        allowed_project_roots=(tmp_path,),
+    )
+    config.validate()
+    server = RuntimeServer(config)
+    binding = RuntimeBinding(
+        binding_id="binding-claude",
+        agent_instance_id="agent-1",
+        chat_id=-1001,
+        thread_id=3,
+        project_id="project-1",
+        canonical_cwd=str(tmp_path),
+        expected_tmux_session="cc-n1001-3",
+    )
+    server.store.upsert_binding(binding)
+    spec = DesiredSpec.build(
+        binding_id=binding.binding_id,
+        agent_instance_id="agent-1",
+        project_id="project-1",
+        canonical_cwd=str(tmp_path),
+        provider="claude_code",
+        account_profile="deepseek_default",
+        model="deepseek-flash",
+        reasoning_effort="max",
+        generation_id="gen-claude",
+        revision=1,
+    )
+    server.store.put_effective_spec(
+        spec,
+        codex_home=credential,
+        profile_fingerprint="secret-v1:sha256:" + "1" * 64,
+    )
+
+    server._project_session_view_once()
+
+    assert list(view.iterdir()) == []
+    assert server._status("request-1")["status"]["session_view"]["error"] is None
+    server.store.close()

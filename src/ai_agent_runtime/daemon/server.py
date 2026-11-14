@@ -1882,6 +1882,8 @@ class RuntimeServer:
             if effective is None:
                 continue
             spec, raw_home, _fingerprint = effective
+            if spec.provider != "codex":
+                continue
             home = validate_profile_path(raw_home, root=self.config.profiles_root)
             if home.name != spec.account_profile:
                 raise SessionViewError("effective account profile identity mismatch")
