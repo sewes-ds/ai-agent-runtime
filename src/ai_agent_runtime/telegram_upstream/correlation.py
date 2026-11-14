@@ -17,6 +17,7 @@ def replaced_start_state(
     binding: RuntimeBinding,
     identity: WrapperIdentity,
     states: tuple[UpstreamTmuxState, ...],
+    provider: str = "codex",
 ) -> UpstreamTmuxState | None:
     """Find the previous durable state for a fresh launch under the same tmux name.
 
@@ -38,7 +39,7 @@ def replaced_start_state(
         if state.chat_id == binding.chat_id
         and state.thread_id == binding.thread_id
         and state.session_name == identity.tmux_session
-        and state.provider == "codex"
+        and state.provider == ("claude" if provider == "claude_code" else provider)
         and state.session_id
         and Path(state.cwd).resolve() == Path(binding.canonical_cwd).resolve()
     )
@@ -51,6 +52,7 @@ def phase_a_identity_candidates(
     bindings: tuple[RuntimeBinding, ...],
     resume_session_id: str | None = None,
     states: tuple[UpstreamTmuxState, ...] = (),
+    provider: str = "codex",
 ) -> tuple[RuntimeBinding, ...]:
     return tuple(
         binding
@@ -63,7 +65,9 @@ def phase_a_identity_candidates(
             )
             or (
                 resume_session_id is None
-                and replaced_start_state(binding=binding, identity=identity, states=states)
+                and replaced_start_state(
+                    binding=binding, identity=identity, states=states, provider=provider
+                )
                 is not None
             )
         )
@@ -78,12 +82,14 @@ def phase_a_correlate(
     topic_config: TopicConfigSnapshot,
     resume_session_id: str | None = None,
     states: tuple[UpstreamTmuxState, ...] = (),
+    provider: str = "codex",
 ) -> RuntimeBinding:
     candidates = phase_a_identity_candidates(
         identity=identity,
         bindings=bindings,
         resume_session_id=resume_session_id,
         states=states,
+        provider=provider,
     )
     if not candidates:
         raise RuntimeFailureError(
@@ -106,7 +112,8 @@ def phase_a_correlate(
     entry = topic_config.topic(binding.thread_id)
     if entry is None:
         raise RuntimeFailureError(ErrorCode.CONFIG_DRIFT, "upstream topic key is absent")
-    if entry.engine != "codex":
+    expected_engine = "claude" if provider == "claude_code" else provider
+    if entry.engine != expected_engine:
         raise RuntimeFailureError(ErrorCode.UNKNOWN_BINDING, "binding is currently unmanaged")
     if entry.exec_mode != "tmux":
         raise RuntimeFailureError(
@@ -125,6 +132,7 @@ def phase_b_verify(
     states: tuple[UpstreamTmuxState, ...],
     topic_config: TopicConfigSnapshot,
     replaced_session_id: str | None = None,
+    provider: str = "codex",
 ) -> UpstreamTmuxState:
     if binding.config_digest != topic_config.digest:
         raise RuntimeFailureError(
@@ -137,7 +145,7 @@ def phase_b_verify(
         if state.chat_id == binding.chat_id
         and state.thread_id == binding.thread_id
         and state.session_name == identity.tmux_session
-        and state.provider == "codex"
+        and state.provider == ("claude" if provider == "claude_code" else provider)
         and Path(state.cwd).resolve() == Path(binding.canonical_cwd).resolve()
     )
     if len(candidates) != 1:
@@ -151,8 +159,9 @@ def phase_b_verify(
             "upstream state still describes the session replaced by /new",
         )
     entry = topic_config.topic(binding.thread_id)
-    if entry is None or not entry.is_managed_candidate:
-        raise RuntimeFailureError(ErrorCode.CONFIG_DRIFT, "topic stopped being codex+tmux")
+    expected_engine = "claude" if provider == "claude_code" else provider
+    if entry is None or not entry.is_managed_candidate or entry.engine != expected_engine:
+        raise RuntimeFailureError(ErrorCode.CONFIG_DRIFT, "topic stopped being provider+tmux")
     if entry.cwd is None or Path(entry.cwd).resolve() != Path(binding.canonical_cwd).resolve():
         raise RuntimeFailureError(ErrorCode.CONFIG_DRIFT, "topic cwd changed during startup")
     return candidates[0]

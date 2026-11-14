@@ -35,6 +35,19 @@ class RuntimeConfig:
     topic_config_path: Path
     tmux_state_path: Path
     upstream_sha: str
+    real_claude: Path = Path.home() / ".local" / "bin" / "claude-real"
+    real_claude_version: str = ""
+    real_claude_sha256: str = ""
+    deepseek_api_key_path: Path = (
+        Path.home()
+        / ".config"
+        / "ai-session-control-center"
+        / "credentials"
+        / "deepseek"
+        / "default.token"
+    )
+    deepseek_api_base_url: str = "https://api.deepseek.com/anthropic"
+    claude_config_root: Path = Path.home() / ".local" / "share" / "ai-agent-runtime" / "claude"
     tmux_session_prefix: str = "cc-"
     tmux_tmpdir: Path | None = None
     sessions_view_root: Path | None = None
@@ -78,6 +91,7 @@ class RuntimeConfig:
         runtime = _table(raw, "runtime")
         telegram = _table(raw, "telegram_agent")
         codex = _table(raw, "codex")
+        claude = _table(raw, "claude_code")
         policy = _table(raw, "policy")
         state_dir = Path(runtime.get("state_dir", defaults.state_dir)).expanduser()
         raw_roots = policy.get("allowed_project_roots", [])
@@ -104,6 +118,18 @@ class RuntimeConfig:
             ).expanduser(),
             tmux_state_path=Path(telegram.get("tmux_state", defaults.tmux_state_path)).expanduser(),
             upstream_sha=str(telegram.get("upstream_sha", "")),
+            real_claude=Path(claude.get("real_binary", defaults.real_claude)).expanduser(),
+            real_claude_version=str(claude.get("version", "")),
+            real_claude_sha256=str(claude.get("sha256", "")),
+            deepseek_api_key_path=Path(
+                claude.get("deepseek_api_key_path", defaults.deepseek_api_key_path)
+            ).expanduser(),
+            deepseek_api_base_url=str(
+                claude.get("deepseek_api_base_url", defaults.deepseek_api_base_url)
+            ).rstrip("/"),
+            claude_config_root=Path(
+                claude.get("config_root", defaults.claude_config_root)
+            ).expanduser(),
             tmux_session_prefix=str(telegram.get("tmux_session_prefix", "cc-")),
             tmux_tmpdir=(
                 Path(str(telegram["tmux_tmpdir"])).expanduser()
@@ -143,6 +169,9 @@ class RuntimeConfig:
             "profiles_root": self.profiles_root,
             "topic_config_path": self.topic_config_path,
             "tmux_state_path": self.tmux_state_path,
+            "real_claude": self.real_claude,
+            "deepseek_api_key_path": self.deepseek_api_key_path,
+            "claude_config_root": self.claude_config_root,
         }.items():
             if not value.is_absolute():
                 raise ValueError(f"{name} must be absolute")
@@ -179,6 +208,17 @@ class RuntimeConfig:
             or any(ch not in "0123456789abcdef" for ch in self.real_codex_sha256[7:])
         ):
             raise ValueError("codex.sha256 must be a sha256-prefixed lowercase digest")
+        if self.real_claude_version or self.real_claude_sha256:
+            if not self.real_claude_version or len(self.real_claude_version) > 100:
+                raise ValueError("claude_code.version is invalid")
+            if (
+                not self.real_claude_sha256.startswith("sha256:")
+                or len(self.real_claude_sha256) != 71
+                or any(ch not in "0123456789abcdef" for ch in self.real_claude_sha256[7:])
+            ):
+                raise ValueError("claude_code.sha256 must be a sha256-prefixed lowercase digest")
+        if self.deepseek_api_base_url != "https://api.deepseek.com/anthropic":
+            raise ValueError("claude_code.deepseek_api_base_url is not an approved endpoint")
         if self.retirement_enabled and not self.retirement_qualification_report_id:
             raise ValueError(
                 "policy.retirement_qualification_report_id is required when retirement is enabled"

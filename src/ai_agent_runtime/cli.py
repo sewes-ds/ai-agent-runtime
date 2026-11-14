@@ -520,6 +520,7 @@ def _deployment_prepare_instance(
     instance_link: str,
     runtime_link: str,
     wrapper_link: str,
+    claude_wrapper_link: str | None,
     output: str,
 ) -> int:
     report = prepare_instance_links(
@@ -528,6 +529,9 @@ def _deployment_prepare_instance(
         instance_link=Path(instance_link),
         runtime_link=Path(runtime_link),
         wrapper_link=Path(wrapper_link),
+        claude_wrapper_link=(
+            Path(claude_wrapper_link) if claude_wrapper_link is not None else None
+        ),
     )
     write_json_artifact(Path(output).expanduser(), report)
     print(json.dumps(report, indent=2, sort_keys=True))
@@ -674,6 +678,7 @@ def main() -> None:
     deployment_prepare.add_argument("--instance-link", required=True)
     deployment_prepare.add_argument("--runtime-link", required=True)
     deployment_prepare.add_argument("--wrapper-link", required=True)
+    deployment_prepare.add_argument("--claude-wrapper-link")
     deployment_prepare.add_argument("--output", required=True)
     deployment_switch = deployment_commands.add_parser("switch-instance-release")
     deployment_switch.add_argument("--old-install-report", required=True)
@@ -794,6 +799,7 @@ def main() -> None:
                         instance_link=namespace.instance_link,
                         runtime_link=namespace.runtime_link,
                         wrapper_link=namespace.wrapper_link,
+                        claude_wrapper_link=namespace.claude_wrapper_link,
                         output=namespace.output,
                     )
                 )

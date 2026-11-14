@@ -15,6 +15,7 @@ Issues = "https://github.com/sewes-ds/ai-agent-runtime/issues"
 [project.scripts]
 ai-agent-runtime = "ai_agent_runtime.cli:main"
 codex-wrapper = "ai_agent_runtime.wrapper.main:main"
+claude-wrapper = "ai_agent_runtime.claude_wrapper.main:main"
 ai-agent-runtime-qualify-upstream = "tools.qualify_telegram_upstream:main"
 ai-agent-runtime-qualify-retirement = "tools.qualify_retirement_race:main"
 

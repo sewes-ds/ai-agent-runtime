@@ -49,6 +49,7 @@ def prepare_instance_links(
     instance_link: Path,
     runtime_link: Path,
     wrapper_link: Path,
+    claude_wrapper_link: Path | None = None,
 ) -> dict[str, object]:
     """Create a new, unstarted instance link set; existing paths fail closed."""
 
@@ -57,10 +58,14 @@ def prepare_instance_links(
     instance_link = instance_link.expanduser()
     runtime_link = runtime_link.expanduser()
     wrapper_link = wrapper_link.expanduser()
+    if claude_wrapper_link is not None:
+        claude_wrapper_link = claude_wrapper_link.expanduser()
     verification = verify_runtime_install_report(install_report)
     if verification.get("accepted") is not True:
         raise InventoryError("Runtime install report is not verified")
-    links = (instance_link, runtime_link, wrapper_link)
+    links = (instance_link, runtime_link, wrapper_link) + (
+        (claude_wrapper_link,) if claude_wrapper_link is not None else ()
+    )
     if len(set(links)) != len(links):
         raise InventoryError("instance entrypoint paths must be distinct")
     if instance_link.name != agent_instance_id:
@@ -69,6 +74,11 @@ def prepare_instance_links(
         raise InventoryError("Runtime entrypoint name does not match AgentInstance")
     if wrapper_link.name != f"codex-wrapper@{agent_instance_id}":
         raise InventoryError("wrapper entrypoint name does not match AgentInstance")
+    if (
+        claude_wrapper_link is not None
+        and claude_wrapper_link.name != f"claude-wrapper@{agent_instance_id}"
+    ):
+        raise InventoryError("Claude wrapper entrypoint name does not match AgentInstance")
     for link in links:
         _safe_parent(link)
         if link.exists() or link.is_symlink():
@@ -76,6 +86,7 @@ def prepare_instance_links(
     release_path = Path(str(verification["release_path"])).resolve(strict=True)
     runtime_target = instance_link / "bin" / "ai-agent-runtime"
     wrapper_target = instance_link / "bin" / "codex-wrapper"
+    claude_wrapper_target = instance_link / "bin" / "claude-wrapper"
     created: list[Path] = []
     try:
         _create_symlink(instance_link, release_path)
@@ -84,6 +95,9 @@ def prepare_instance_links(
         created.append(runtime_link)
         _create_symlink(wrapper_link, wrapper_target)
         created.append(wrapper_link)
+        if claude_wrapper_link is not None:
+            _create_symlink(claude_wrapper_link, claude_wrapper_target)
+            created.append(claude_wrapper_link)
         if runtime_link.resolve(strict=True) != Path(
             str(verification["runtime_executable"])
         ).resolve(strict=True):
@@ -94,6 +108,10 @@ def prepare_instance_links(
             str(verification["wrapper_executable"])
         ).resolve(strict=True):
             raise InventoryError("prepared wrapper does not resolve to installed release")
+        if claude_wrapper_link is not None and claude_wrapper_link.resolve(strict=True) != (
+            release_path / "bin" / "claude-wrapper"
+        ):
+            raise InventoryError("prepared Claude wrapper does not resolve to installed release")
         for parent in {path.parent for path in links}:
             directory_fd = os.open(parent, os.O_RDONLY)
             try:
@@ -114,6 +132,9 @@ def prepare_instance_links(
         "instance_link": str(instance_link),
         "runtime_link": str(runtime_link),
         "wrapper_link": str(wrapper_link),
+        "claude_wrapper_link": (
+            str(claude_wrapper_link) if claude_wrapper_link is not None else None
+        ),
         "services_started": False,
         "services_restarted": False,
         "production_cutover_authorized": False,

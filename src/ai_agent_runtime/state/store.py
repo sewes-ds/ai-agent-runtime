@@ -436,14 +436,12 @@ class RuntimeStore:
             ),
             desired_provider=(
                 str(desired_payload["provider"])
-                if desired_payload is not None
-                and isinstance(desired_payload.get("provider"), str)
+                if desired_payload is not None and isinstance(desired_payload.get("provider"), str)
                 else None
             ),
             desired_model=(
                 str(desired_payload["model"])
-                if desired_payload is not None
-                and isinstance(desired_payload.get("model"), str)
+                if desired_payload is not None and isinstance(desired_payload.get("model"), str)
                 else None
             ),
             live_instance_count=len(live_rows),
@@ -1061,9 +1059,7 @@ class RuntimeStore:
             resync_from_boot_id = row["resync_from_boot_id"]
             resynchronized = stored_boot_id != daemon_boot_id
             if resynchronized:
-                if previous_daemon_boot_id not in {
-                    stored_boot_id, resync_from_boot_id
-                }:
+                if previous_daemon_boot_id not in {stored_boot_id, resync_from_boot_id}:
                     raise KeyError("heartbeat previous daemon boot identity mismatch")
                 # A launch is stored at generation 0; the wrapper's *first*
                 # heartbeat uses generation 1. A daemon may restart between
@@ -1452,6 +1448,58 @@ class RuntimeStore:
             if cursor.rowcount != 1:
                 raise KeyError(f"unknown instance: {instance_id}")
 
+    def record_process_applied_spec(
+        self,
+        *,
+        instance_id: str,
+        binding_id: str,
+        spec: DesiredSpec,
+        evidence: dict[str, object],
+    ) -> None:
+        """Persist provider-neutral process evidence without inventing rollout provenance."""
+
+        normalized = dict(evidence)
+        normalized.setdefault("spec_digest", spec.spec_digest)
+        normalized.setdefault("provider", spec.provider)
+        normalized.setdefault("account_profile", spec.account_profile)
+        normalized.setdefault("actual_model", spec.model)
+        normalized.setdefault("actual_reasoning_effort", spec.reasoning_effort)
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO applied_specs(
+                    instance_id, binding_id, generation_id, revision,
+                    spec_digest, evidence_json, verified_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(instance_id) DO UPDATE SET
+                    binding_id=excluded.binding_id,
+                    generation_id=excluded.generation_id,
+                    revision=excluded.revision,
+                    spec_digest=excluded.spec_digest,
+                    evidence_json=excluded.evidence_json,
+                    verified_at=excluded.verified_at
+                """,
+                (
+                    instance_id,
+                    binding_id,
+                    spec.generation_id,
+                    spec.revision,
+                    spec.spec_digest,
+                    encoded,
+                    time.time(),
+                ),
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE instances SET applied_digest=?, updated_at=?
+                WHERE instance_id=? AND binding_id=?
+                """,
+                (spec.spec_digest, time.time(), instance_id, binding_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown instance: {instance_id}")
+
     def get_applied_evidence(self, instance_id: str) -> dict[str, object] | None:
         row = self._connection.execute(
             "SELECT evidence_json FROM applied_specs WHERE instance_id=?",
@@ -1516,6 +1564,8 @@ class RuntimeStore:
             evidence = json.loads(row["evidence_json"])
             if not isinstance(evidence, dict):
                 raise ValueError("persisted AppliedSpec evidence is invalid")
+            if evidence.get("provider", "codex") != "codex":
+                continue
             targets.append(
                 RolloutObservationTarget(
                     instance_id=str(row["instance_id"]),

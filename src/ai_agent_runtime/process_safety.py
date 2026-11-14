@@ -343,6 +343,90 @@ def profile_fingerprint(path: Path) -> str:
     return f"profile-v2:sha256:{hashlib.sha256(material).hexdigest()}"
 
 
+def validate_secret_file(path: Path, *, uid: int | None = None) -> Path:
+    expected_uid = os.getuid() if uid is None else uid
+    if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+        raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "credential path is unsafe")
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "credential must be a regular file")
+    if metadata.st_uid != expected_uid or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "credential must be owner-only")
+    if metadata.st_size <= 0 or metadata.st_size > 4096:
+        raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "credential size is invalid")
+    return path.resolve(strict=True)
+
+
+def secret_file_fingerprint(path: Path) -> str:
+    resolved = validate_secret_file(path)
+    metadata = resolved.stat()
+    material = repr(
+        (
+            str(resolved),
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            stat.S_IMODE(metadata.st_mode),
+        )
+    ).encode()
+    return f"secret-v1:sha256:{hashlib.sha256(material).hexdigest()}"
+
+
+def verify_claude_child(
+    *,
+    child_pid: int,
+    child_starttime: int,
+    wrapper_pid: int,
+    credential_path: Path,
+    config_dir: Path,
+    base_url: str,
+    model: str,
+    reasoning_effort: str,
+    real_claude: Path,
+) -> dict[str, object]:
+    if proc_uid(child_pid) != os.getuid() or proc_starttime(child_pid) != child_starttime:
+        raise RuntimeFailureError(ErrorCode.CORRELATION_MISMATCH, "Claude child identity mismatch")
+    if proc_parent_pid(child_pid) != wrapper_pid:
+        raise RuntimeFailureError(ErrorCode.CORRELATION_MISMATCH, "Claude child parent mismatch")
+    environment = proc_environment(child_pid)
+    expected = {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_MODEL": model,
+        "CLAUDE_CODE_EFFORT_LEVEL": reasoning_effort,
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+    }
+    if any(environment.get(key) != value for key, value in expected.items()):
+        raise RuntimeFailureError(
+            ErrorCode.CORRELATION_MISMATCH, "Claude child environment mismatch"
+        )
+    if not environment.get("ANTHROPIC_AUTH_TOKEN"):
+        raise RuntimeFailureError(ErrorCode.CORRELATION_MISMATCH, "Claude auth token is absent")
+    argv = proc_cmdline(child_pid)
+    if str(real_claude) not in argv:
+        raise RuntimeFailureError(
+            ErrorCode.CORRELATION_MISMATCH, "real Claude path absent from argv"
+        )
+    try:
+        actual_model = argv[argv.index("--model") + 1]
+    except (ValueError, IndexError) as exc:
+        raise RuntimeFailureError(ErrorCode.CORRELATION_MISMATCH, "Claude model is absent") from exc
+    if actual_model != model:
+        raise RuntimeFailureError(ErrorCode.CORRELATION_MISMATCH, "Claude model mismatch")
+    binary_stat = real_claude.stat()
+    return {
+        "provider": "claude_code",
+        "credential_fingerprint": secret_file_fingerprint(credential_path),
+        "actual_model": actual_model,
+        "actual_reasoning_effort": reasoning_effort,
+        "real_claude_path": str(real_claude),
+        "real_claude_device": binary_stat.st_dev,
+        "real_claude_inode": binary_stat.st_ino,
+        "real_claude_sha256": file_sha256(real_claude),
+        "child_pid": child_pid,
+        "child_starttime": child_starttime,
+    }
+
+
 def verify_codex_child(
     *,
     child_pid: int,

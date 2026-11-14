@@ -71,7 +71,7 @@ class TopicConfigEntry:
 
     @property
     def is_managed_candidate(self) -> bool:
-        return self.engine == "codex" and self.exec_mode == "tmux"
+        return self.engine in {"codex", "claude"} and self.exec_mode == "tmux"
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +160,7 @@ def reconcile_managed_topic(
     cwd: str,
     expected_digest: str | None,
     backup_dir: Path,
+    provider: str = "codex",
 ) -> TopicConfigSnapshot:
     """Patch allowlisted fields without claiming cross-process serializability.
 
@@ -172,6 +173,7 @@ def reconcile_managed_topic(
         managed_topics={thread_id: cwd},
         expected_digest=expected_digest,
         backup_dir=backup_dir,
+        providers={thread_id: provider},
     )
 
 
@@ -181,6 +183,7 @@ def reconcile_managed_topics(
     managed_topics: dict[int, str],
     expected_digest: str | None,
     backup_dir: Path,
+    providers: dict[int, str] | None = None,
 ) -> TopicConfigSnapshot:
     """Patch multiple upstream-created topics in one atomic file replacement."""
 
@@ -224,13 +227,17 @@ def reconcile_managed_topics(
             initial = initial_topics.get(key)
             if not isinstance(initial, dict):
                 raise KeyError(f"upstream topic key does not exist: {thread_id}")
-            for field, desired in (("cwd", cwd), ("engine", "codex"), ("exec_mode", "tmux")):
+            provider = (providers or {}).get(thread_id, "codex")
+            if provider not in {"codex", "claude_code"}:
+                raise ValueError(f"unsupported managed provider: {provider}")
+            engine = "claude" if provider == "claude_code" else "codex"
+            for field, desired in (("cwd", cwd), ("engine", engine), ("exec_mode", "tmux")):
                 observed = current.get(field)
                 if observed not in (initial.get(field), desired):
                     conflict = True
             if not conflict:
                 entry = dict(current)
-                entry.update({"cwd": cwd, "engine": "codex", "exec_mode": "tmux"})
+                entry.update({"cwd": cwd, "engine": engine, "exec_mode": "tmux"})
                 updated_topics[key] = entry
         updated_root["topics"] = updated_topics
 
@@ -289,6 +296,12 @@ def reconcile_managed_topics(
     after = read_topic_config(path)
     for thread_id, cwd in managed_topics.items():
         actual = after.topic(thread_id)
-        if actual is None or actual.cwd != cwd or not actual.is_managed_candidate:
+        expected_engine = "claude" if (providers or {}).get(thread_id) == "claude_code" else "codex"
+        if (
+            actual is None
+            or actual.cwd != cwd
+            or actual.engine != expected_engine
+            or not actual.is_managed_candidate
+        ):
             raise RuntimeError("topic_config post-write verification failed")
     return after

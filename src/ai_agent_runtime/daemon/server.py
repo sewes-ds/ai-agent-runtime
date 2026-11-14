@@ -44,9 +44,12 @@ from ai_agent_runtime.process_safety import (
     process_executable_evidence,
     profile_fingerprint,
     retire_tmux_session,
+    secret_file_fingerprint,
     validate_owned_executable,
     validate_profile_path,
     validate_project_path,
+    validate_secret_file,
+    verify_claude_child,
     verify_codex_child,
     verify_process_executable_evidence,
     verify_wrapper_identity,
@@ -202,6 +205,7 @@ class RuntimeServer:
         phase_b_timeout: float = 45.0,
         identity_verifier: Callable[[WrapperIdentity], None] = verify_wrapper_identity,
         child_verifier: Callable[..., dict[str, object]] = verify_codex_child,
+        claude_child_verifier: Callable[..., dict[str, object]] = verify_claude_child,
         retirement_executor: Callable[[WrapperIdentity], None] = retire_tmux_session,
         evidence_interval: float = 1.0,
     ) -> None:
@@ -211,11 +215,26 @@ class RuntimeServer:
         self.boot_id = str(uuid.uuid4())
         self.identity_verifier = identity_verifier
         self.child_verifier = child_verifier
+        self.claude_child_verifier = claude_child_verifier
         self.retirement_executor = retirement_executor
         self.evidence_interval = evidence_interval
         self._results: OrderedDict[str, tuple[str, dict[str, Any]]] = OrderedDict()
         self._session_view_error: str | None = None
         self._rollout_observer_faults: set[str] = set()
+
+    def _profile_reference(self, spec: DesiredSpec) -> tuple[Path, str]:
+        if spec.provider == "codex":
+            profile = validate_profile_path(
+                self.config.profiles_root / spec.account_profile,
+                root=self.config.profiles_root,
+            )
+            return profile, profile_fingerprint(profile)
+        if spec.provider == "claude_code":
+            if spec.account_profile != "deepseek_default":
+                raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "unknown DeepSeek profile")
+            credential = validate_secret_file(self.config.deepseek_api_key_path)
+            return credential, secret_file_fingerprint(credential)
+        raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "unsupported managed provider")
 
     async def serve(self) -> None:
         self._refresh_effective_profile_attestations_once()
@@ -276,11 +295,25 @@ class RuntimeServer:
             codex_home,
             previous,
         ) in self.store.effective_profile_attestations():
-            safe_home = validate_profile_path(codex_home, root=self.config.profiles_root)
-            current = profile_fingerprint(safe_home)
+            effective = self.store.get_effective_spec(binding_id)
+            if effective is None:
+                continue
+            spec, _profile, _fingerprint = effective
+            if spec.provider == "codex":
+                safe_home = validate_profile_path(codex_home, root=self.config.profiles_root)
+                current = profile_fingerprint(safe_home)
+            elif spec.provider == "claude_code":
+                safe_home = validate_secret_file(codex_home)
+                current = secret_file_fingerprint(safe_home)
+            else:
+                raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "unsupported provider profile")
             if current == previous:
                 continue
-            if not previous.startswith("sha256:"):
+            if not (
+                previous.startswith("sha256:")
+                or previous.startswith("profile-v2:sha256:")
+                or previous.startswith("secret-v1:sha256:")
+            ):
                 raise RuntimeFailureError(
                     ErrorCode.UNSAFE_PROFILE,
                     f"unsupported profile attestation for binding {binding_id}",
@@ -416,6 +449,9 @@ class RuntimeServer:
     ) -> dict[str, Any]:
         if payload.get("agent_instance_id") != self.config.agent_instance_id:
             raise RuntimeFailureError(ErrorCode.UNKNOWN_BINDING, "AgentInstance namespace mismatch")
+        provider = payload.get("provider_hint", "codex")
+        if provider not in {"codex", "claude_code"}:
+            raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "unsupported provider hint")
         identity = _identity(payload)
         _verify_claimed_peer(identity, peer_pid=peer_pid, peer_uid=peer_uid)
         self.identity_verifier(identity)
@@ -435,6 +471,7 @@ class RuntimeServer:
                 topic_config=config_snapshot,
                 resume_session_id=resume_session_id,
                 states=state_snapshot,
+                provider=provider,
             )
         except RuntimeFailureError as exc:
             candidates = phase_a_identity_candidates(
@@ -442,6 +479,7 @@ class RuntimeServer:
                 bindings=bindings,
                 resume_session_id=resume_session_id,
                 states=state_snapshot,
+                provider=provider,
             )
             if exc.code is ErrorCode.UNSUPPORTED_CODEX_SUBPROCESS and len(candidates) == 1:
                 self.store.enqueue_user_notification(
@@ -463,6 +501,10 @@ class RuntimeServer:
                 ErrorCode.UNKNOWN_BINDING, "binding has no verified local spec"
             )
         spec, codex_home, profile_fingerprint = effective
+        if spec.provider != provider:
+            raise RuntimeFailureError(
+                ErrorCode.UNKNOWN_BINDING, "wrapper provider differs from desired provider"
+            )
         if spec.agent_instance_id != self.config.agent_instance_id:
             raise RuntimeFailureError(
                 ErrorCode.UNKNOWN_BINDING, "effective spec namespace mismatch"
@@ -479,22 +521,37 @@ class RuntimeServer:
                     ErrorCode.RESUME_BINDING_MISMATCH,
                     "session does not belong to this binding and account",
                 )
-        real_codex = validate_owned_executable(self.config.real_codex)
-        real_digest = file_sha256(real_codex)
-        if real_digest != self.config.real_codex_sha256:
-            raise RuntimeFailureError(
-                ErrorCode.UNSAFE_BINARY,
-                "real Codex digest differs from qualified release tuple",
-            )
-        safe_home = validate_profile_path(codex_home, root=self.config.profiles_root)
-        try:
-            self._project_session_view_once()
-        except (OSError, ValueError, SessionViewError) as exc:
-            self._session_view_error = f"{type(exc).__name__}: {exc}"
-            raise RuntimeFailureError(
-                ErrorCode.SESSION_VIEW_UNAVAILABLE,
-                f"qualified upstream transcript view is unavailable: {exc}",
-            ) from exc
+        if provider == "codex":
+            real_binary = validate_owned_executable(self.config.real_codex)
+            real_digest = file_sha256(real_binary)
+            if real_digest != self.config.real_codex_sha256:
+                raise RuntimeFailureError(
+                    ErrorCode.UNSAFE_BINARY,
+                    "real Codex digest differs from qualified release tuple",
+                )
+            safe_profile = validate_profile_path(codex_home, root=self.config.profiles_root)
+            try:
+                self._project_session_view_once()
+            except (OSError, ValueError, SessionViewError) as exc:
+                self._session_view_error = f"{type(exc).__name__}: {exc}"
+                raise RuntimeFailureError(
+                    ErrorCode.SESSION_VIEW_UNAVAILABLE,
+                    f"qualified upstream transcript view is unavailable: {exc}",
+                ) from exc
+        else:
+            if spec.account_profile != "deepseek_default":
+                raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "unknown DeepSeek profile")
+            if not self.config.real_claude_version or not self.config.real_claude_sha256:
+                raise RuntimeFailureError(
+                    ErrorCode.UNSAFE_BINARY, "Claude Code release is not configured"
+                )
+            real_binary = validate_owned_executable(self.config.real_claude)
+            real_digest = file_sha256(real_binary)
+            if real_digest != self.config.real_claude_sha256:
+                raise RuntimeFailureError(
+                    ErrorCode.UNSAFE_BINARY, "real Claude digest differs from configured release"
+                )
+            safe_profile = validate_secret_file(codex_home)
         instance_id = str(uuid.uuid4())
         launch_context: dict[str, object] = {
             "wrapper_identity": {
@@ -516,17 +573,34 @@ class RuntimeServer:
                 "revision": spec.revision,
                 "spec_digest": spec.spec_digest,
             },
-            "codex_home": str(safe_home),
             "profile_fingerprint": profile_fingerprint,
-            "real_codex": str(real_codex),
-            "real_codex_version": self.config.real_codex_version,
-            "real_codex_sha256": real_digest,
         }
+        if provider == "codex":
+            launch_context.update(
+                {
+                    "codex_home": str(safe_profile),
+                    "real_codex": str(real_binary),
+                    "real_codex_version": self.config.real_codex_version,
+                    "real_codex_sha256": real_digest,
+                }
+            )
+        else:
+            launch_context.update(
+                {
+                    "credential_path": str(safe_profile),
+                    "real_claude": str(real_binary),
+                    "real_claude_version": self.config.real_claude_version,
+                    "real_claude_sha256": real_digest,
+                    "deepseek_api_base_url": self.config.deepseek_api_base_url,
+                    "claude_config_dir": str(self.config.claude_config_root / spec.account_profile),
+                }
+            )
         if resume_session_id is None:
             previous = replaced_start_state(
                 binding=binding,
                 identity=identity,
                 states=state_snapshot,
+                provider=provider,
             )
             if previous is not None:
                 launch_context["replaced_session_id"] = previous.session_id
@@ -545,7 +619,7 @@ class RuntimeServer:
             daemon_boot_id=self.boot_id,
             connection_generation=0,
         )
-        return self._ok(
+        response = self._ok(
             request_id,
             instance_id=instance_id,
             binding_id=binding.binding_id,
@@ -556,13 +630,32 @@ class RuntimeServer:
                 "account_profile": spec.account_profile,
                 "model": spec.model,
                 "reasoning_effort": spec.reasoning_effort,
-                "codex_home": str(safe_home),
                 "profile_fingerprint": profile_fingerprint,
-                "real_codex": str(real_codex),
-                "real_codex_version": self.config.real_codex_version,
-                "real_codex_sha256": real_digest,
             },
         )
+        response_spec = response["spec"]
+        assert isinstance(response_spec, dict)
+        if provider == "codex":
+            response_spec.update(
+                {
+                    "codex_home": str(safe_profile),
+                    "real_codex": str(real_binary),
+                    "real_codex_version": self.config.real_codex_version,
+                    "real_codex_sha256": real_digest,
+                }
+            )
+        else:
+            response_spec.update(
+                {
+                    "credential_path": str(safe_profile),
+                    "real_claude": str(real_binary),
+                    "real_claude_version": self.config.real_claude_version,
+                    "real_claude_sha256": real_digest,
+                    "deepseek_api_base_url": self.config.deepseek_api_base_url,
+                    "claude_config_dir": str(self.config.claude_config_root / spec.account_profile),
+                }
+            )
+        return response
 
     def _apply_binding(self, request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raw_binding = payload.get("binding")
@@ -596,10 +689,8 @@ class RuntimeServer:
             raise RuntimeFailureError(
                 ErrorCode.INVALID_REQUEST, "desired project identity mismatch"
             )
-        if spec.provider != "codex":
-            raise RuntimeFailureError(
-                ErrorCode.INVALID_REQUEST, "V1 managed provider must be codex"
-            )
+        if spec.provider not in {"codex", "claude_code"}:
+            raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "unsupported managed provider")
         existing_binding = self.store.get_binding(binding_id)
         if existing_binding is not None:
             if (
@@ -643,11 +734,7 @@ class RuntimeServer:
             or Path(profile_name).name != profile_name
         ):
             raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "invalid account profile name")
-        codex_home = validate_profile_path(
-            self.config.profiles_root / profile_name,
-            root=self.config.profiles_root,
-        )
-        fingerprint = profile_fingerprint(codex_home)
+        codex_home, fingerprint = self._profile_reference(spec)
         adapter = TelegramUpstreamAdapter(
             self.config.upstream_sha,
             self.config.tmux_session_prefix,
@@ -660,13 +747,25 @@ class RuntimeServer:
         for _ in range(3):
             before = read_topic_config(self.config.topic_config_path)
             current_entry = before.topic(thread_id)
-            if existing_binding is not None and (
-                current_entry is None or not current_entry.is_managed_candidate
-            ):
-                raise RuntimeFailureError(
-                    ErrorCode.CONFIG_DRIFT,
-                    "existing binding left codex+tmux; CUS will not restore it implicitly",
+            if existing_binding is not None:
+                previous_effective = self.store.get_effective_spec(binding_id)
+                previous_engine = (
+                    "claude"
+                    if previous_effective is not None
+                    and previous_effective[0].provider == "claude_code"
+                    else "codex"
                 )
+                if (
+                    previous_effective is None
+                    or current_entry is None
+                    or not current_entry.is_managed_candidate
+                    or current_entry.engine != previous_engine
+                ):
+                    raise RuntimeFailureError(
+                        ErrorCode.CONFIG_DRIFT,
+                        "existing binding provider state drifted; "
+                        "CUS will not restore it implicitly",
+                    )
             try:
                 snapshot = reconcile_managed_topic(
                     self.config.topic_config_path,
@@ -674,6 +773,7 @@ class RuntimeServer:
                     cwd=str(requested_cwd),
                     expected_digest=before.digest,
                     backup_dir=self.config.state_dir / "topic-config-backups",
+                    provider=spec.provider,
                 )
                 break
             except KeyError as exc:
@@ -759,6 +859,7 @@ class RuntimeServer:
         normalized_unmanaged: list[dict[str, Any]] = []
         prepared: list[tuple[RuntimeBinding, DesiredSpec, Path, str]] = []
         managed_topics: dict[int, str] = {}
+        managed_providers: dict[int, str] = {}
         binding_ids: set[str] = set()
         tmux_sessions: set[str] = set()
         for raw_item in raw_items:
@@ -790,6 +891,7 @@ class RuntimeServer:
             binding_ids.add(binding.binding_id)
             tmux_sessions.add(binding.expected_tmux_session)
             managed_topics[binding.thread_id] = binding.canonical_cwd
+            managed_providers[binding.thread_id] = spec.provider
             prepared.append((binding, spec, codex_home, fingerprint))
             normalized_items.append({"binding": raw_binding, "desired": raw_desired})
 
@@ -938,10 +1040,10 @@ class RuntimeServer:
                     ErrorCode.CONFIG_DRIFT,
                     "unmanaged binding topic is absent",
                 )
-            if entry.engine == "codex":
+            if entry.is_managed_candidate:
                 raise RuntimeFailureError(
                     ErrorCode.INVALID_REQUEST,
-                    "codex topic cannot be imported as unmanaged",
+                    "managed provider topic cannot be imported as unmanaged",
                 )
             if (
                 entry.cwd is None
@@ -970,6 +1072,7 @@ class RuntimeServer:
                         managed_topics=managed_topics,
                         expected_digest=snapshot.digest,
                         backup_dir=self.config.state_dir / "topic-config-backups",
+                        providers=managed_providers,
                     )
                     break
                 except KeyError as exc:
@@ -1356,10 +1459,10 @@ class RuntimeServer:
             raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "desired identity mismatch")
         if spec.generation_id != generation_id:
             raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "desired generation mismatch")
-        if spec.provider != "codex":
+        if spec.provider not in {"codex", "claude_code"}:
             raise RuntimeFailureError(
                 ErrorCode.INVALID_REQUEST,
-                "V1 managed provider must be codex",
+                "unsupported managed provider",
             )
         existing = self.store.get_binding(binding_id)
         if existing is not None and (
@@ -1390,10 +1493,7 @@ class RuntimeServer:
             or Path(profile_name).name != profile_name
         ):
             raise RuntimeFailureError(ErrorCode.UNSAFE_PROFILE, "invalid account profile name")
-        codex_home = validate_profile_path(
-            self.config.profiles_root / profile_name,
-            root=self.config.profiles_root,
-        )
+        codex_home, fingerprint = self._profile_reference(spec)
         adapter = TelegramUpstreamAdapter(
             self.config.upstream_sha,
             self.config.tmux_session_prefix,
@@ -1413,7 +1513,7 @@ class RuntimeServer:
             ),
             spec,
             codex_home,
-            profile_fingerprint(codex_home),
+            fingerprint,
         )
 
     async def _verify_started(
@@ -1460,17 +1560,30 @@ class RuntimeServer:
         replaced_session_id = launch.get("replaced_session_id")
         if replaced_session_id is not None and not isinstance(replaced_session_id, str):
             raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "replaced session id is invalid")
-        codex_home = Path(_required_str(launch, "codex_home"))
-        real_codex = Path(_required_str(launch, "real_codex"))
-        self.child_verifier(
-            child_pid=child_pid,
-            child_starttime=child_starttime,
-            wrapper_pid=identity.pid,
-            codex_home=codex_home,
-            model=spec.model,
-            reasoning_effort=spec.reasoning_effort,
-            real_codex=real_codex,
-        )
+        if spec.provider == "codex":
+            process_evidence = self.child_verifier(
+                child_pid=child_pid,
+                child_starttime=child_starttime,
+                wrapper_pid=identity.pid,
+                codex_home=Path(_required_str(launch, "codex_home")),
+                model=spec.model,
+                reasoning_effort=spec.reasoning_effort,
+                real_codex=Path(_required_str(launch, "real_codex")),
+            )
+        elif spec.provider == "claude_code":
+            process_evidence = self.claude_child_verifier(
+                child_pid=child_pid,
+                child_starttime=child_starttime,
+                wrapper_pid=identity.pid,
+                credential_path=Path(_required_str(launch, "credential_path")),
+                config_dir=Path(_required_str(launch, "claude_config_dir")),
+                base_url=_required_str(launch, "deepseek_api_base_url"),
+                model=spec.model,
+                reasoning_effort=spec.reasoning_effort,
+                real_claude=Path(_required_str(launch, "real_claude")),
+            )
+        else:
+            raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "unsupported launched provider")
         deadline = asyncio.get_running_loop().time() + self.phase_b_timeout
         last_failure: RuntimeFailureError | None = None
         while asyncio.get_running_loop().time() < deadline:
@@ -1481,6 +1594,7 @@ class RuntimeServer:
                     states=read_tmux_states(self.config.tmux_state_path),
                     topic_config=read_topic_config(self.config.topic_config_path),
                     replaced_session_id=replaced_session_id,
+                    provider=spec.provider,
                 )
                 break
             except RuntimeFailureError as exc:
@@ -1504,15 +1618,35 @@ class RuntimeServer:
             # Phase B proves binding/process correlation, but a new Codex
             # session's rollout identity is not necessarily durable yet.
             # AppliedSpec remains unset until rollout evidence is collected.
-            applied_digest=None,
+            applied_digest=spec.spec_digest if spec.provider == "claude_code" else None,
             daemon_boot_id=self.boot_id,
             connection_generation=registered.connection_generation,
             heartbeat_at=time.time(),
         )
+        if spec.provider == "claude_code":
+            self.store.record_session_provenance(
+                session_id=state.session_id,
+                binding_id=binding_id,
+                account_profile=spec.account_profile,
+                rollout_path=state.transcript_path or "",
+            )
+            self.store.record_process_applied_spec(
+                instance_id=instance_id,
+                binding_id=binding_id,
+                spec=spec,
+                evidence={
+                    **process_evidence,
+                    "profile_fingerprint": _required_str(launch, "profile_fingerprint"),
+                    "tmux_session": identity.tmux_session,
+                    "tmux_pane": identity.tmux_pane,
+                    "session_id": state.session_id,
+                    "daemon_boot_id": self.boot_id,
+                },
+            )
         return self._ok(
             request_id,
             verified=True,
-            applied=False,
+            applied=spec.provider == "claude_code",
             session_id=state.session_id,
             expected_spec_digest=spec.spec_digest,
         )
@@ -1839,9 +1973,12 @@ class RuntimeServer:
         snapshot = read_topic_config(self.config.topic_config_path)
         for binding in self.store.list_bindings(self.config.agent_instance_id):
             entry = snapshot.topic(binding.thread_id)
-            if entry is None:
+            effective = self.store.get_effective_spec(binding.binding_id)
+            if entry is None or effective is None:
                 mode = ManagementMode.CONFIG_DRIFT
-            elif entry.engine != "codex":
+            elif entry.engine != (
+                "claude" if effective[0].provider == "claude_code" else effective[0].provider
+            ):
                 mode = ManagementMode.UNMANAGED
             elif (
                 entry.cwd is not None
@@ -2020,9 +2157,15 @@ class RuntimeServer:
             try:
                 snapshot = read_topic_config(self.config.topic_config_path)
                 entry = snapshot.topic(binding.thread_id)
+                effective = self.store.get_effective_spec(binding.binding_id)
+                expected_engine = (
+                    "claude"
+                    if effective is not None and effective[0].provider == "claude_code"
+                    else "codex"
+                )
                 config_is_current = (
                     entry is not None
-                    and entry.engine == "codex"
+                    and entry.engine == expected_engine
                     and entry.exec_mode == "tmux"
                     and entry.cwd is not None
                     and Path(entry.cwd).resolve() == Path(binding.canonical_cwd).resolve()

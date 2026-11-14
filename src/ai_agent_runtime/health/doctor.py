@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import stat
@@ -18,8 +19,10 @@ from ai_agent_runtime.ipc.protocol import versioned
 from ai_agent_runtime.process_safety import (
     file_sha256,
     profile_fingerprint,
+    secret_file_fingerprint,
     validate_owned_executable,
     validate_profile_path,
+    validate_secret_file,
 )
 from ai_agent_runtime.telegram_upstream.tmux_state import read_tmux_states
 from ai_agent_runtime.telegram_upstream.topic_config import read_topic_config
@@ -118,18 +121,47 @@ def _check_real_codex(config: RuntimeConfig) -> str:
     return f"path={binary} version={config.real_codex_version} digest={observed_digest}"
 
 
+def _check_real_claude(config: RuntimeConfig) -> str:
+    if not config.real_claude_version or not config.real_claude_sha256:
+        return "not configured"
+    binary = validate_owned_executable(config.real_claude)
+    observed_digest = file_sha256(binary)
+    if observed_digest != config.real_claude_sha256:
+        raise ValueError("real Claude digest differs from the configured release tuple")
+    completed = subprocess.run(
+        (str(binary), "--version"),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}".strip()
+    if completed.returncode != 0 or config.real_claude_version not in output:
+        raise ValueError("real Claude version differs from the configured release tuple")
+    return f"path={binary} version={config.real_claude_version} digest={observed_digest}"
+
+
 def _check_profiles(config: RuntimeConfig) -> str:
     root = validate_profile_path(config.profiles_root, root=config.profiles_root)
     connection = _open_database_read_only(config.database_path)
     try:
         rows = connection.execute(
-            "SELECT codex_home, profile_fingerprint FROM effective_specs ORDER BY binding_id"
+            """
+            SELECT payload_json, codex_home, profile_fingerprint
+            FROM effective_specs ORDER BY binding_id
+            """
         ).fetchall()
     finally:
         connection.close()
     for row in rows:
-        profile = validate_profile_path(Path(str(row["codex_home"])), root=root)
-        if profile_fingerprint(profile) != row["profile_fingerprint"]:
+        payload = json.loads(str(row["payload_json"]))
+        if payload.get("provider") == "claude_code":
+            profile = validate_secret_file(Path(str(row["codex_home"])))
+            fingerprint = secret_file_fingerprint(profile)
+        else:
+            profile = validate_profile_path(Path(str(row["codex_home"])), root=root)
+            fingerprint = profile_fingerprint(profile)
+        if fingerprint != row["profile_fingerprint"]:
             raise ValueError(f"profile metadata changed after verification: {profile.name}")
     return f"root={root} verified_effective_profiles={len(rows)}"
 
@@ -173,7 +205,7 @@ def _check_correlation(config: RuntimeConfig) -> str:
         ).fetchall()
         active_instances = connection.execute(
             """
-            SELECT binding_id, tmux_session, lifecycle
+            SELECT binding_id, tmux_session, lifecycle, launch_spec_json
             FROM instances
             WHERE lifecycle NOT IN ('EXITED', 'RETIRED_FOR_RESTART')
             """
@@ -201,13 +233,17 @@ def _check_correlation(config: RuntimeConfig) -> str:
         ):
             raise ValueError(f"managed binding config drift: {binding['binding_id']}")
         for instance in by_binding.get(str(binding["binding_id"]), []):
+            raw_launch = instance["launch_spec_json"]
+            launch = json.loads(raw_launch) if isinstance(raw_launch, str) else {}
+            desired = launch.get("desired", {}) if isinstance(launch, dict) else {}
+            expected_provider = "claude" if desired.get("provider") == "claude_code" else "codex"
             matches = [
                 state
                 for state in states
                 if state.chat_id == config.forum_chat_id
                 and state.thread_id == int(binding["thread_id"])
                 and state.session_name == instance["tmux_session"]
-                and state.provider == "codex"
+                and state.provider == expected_provider
                 and _canonical_existing(state.cwd) == str(binding["canonical_cwd"])
             ]
             if len(matches) != 1:
@@ -250,6 +286,7 @@ async def collect_doctor_report(
         }
     _record(checks, "database", lambda: _check_database(config.database_path))
     _record(checks, "real_codex", lambda: _check_real_codex(config))
+    _record(checks, "real_claude", lambda: _check_real_claude(config))
     _record(checks, "profiles", lambda: _check_profiles(config))
     _record(
         checks,

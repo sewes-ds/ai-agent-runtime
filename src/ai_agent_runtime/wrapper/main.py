@@ -467,6 +467,7 @@ def run(argv: list[str]) -> int:
         "register",
         str(uuid.uuid4()),
         agent_instance_id=config.agent_instance_id,
+        provider_hint="codex",
         resume_session_id=invocation.resume_session_id,
         **identity,
     )
