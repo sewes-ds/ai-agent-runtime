@@ -1624,6 +1624,11 @@ class RuntimeServer:
             heartbeat_at=time.time(),
         )
         if spec.provider == "claude_code":
+            if state.session_id is None:
+                raise RuntimeFailureError(
+                    ErrorCode.CORRELATION_MISMATCH,
+                    "Claude launch completed without a session id",
+                )
             self.store.record_session_provenance(
                 session_id=state.session_id,
                 binding_id=binding_id,
