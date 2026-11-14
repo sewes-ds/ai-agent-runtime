@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -24,6 +26,8 @@ from ai_agent_runtime.wrapper.main import (
 
 _INSTANCE_EXECUTABLE = re.compile(r"^claude-wrapper@([A-Za-z0-9][A-Za-z0-9_.-]{0,63})$")
 _SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+_TMUX_SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_PROVIDER_RUNTIME_METADATA = "provider.runtime.json"
 
 
 def _config_path(executable: str | None = None) -> Path:
@@ -56,6 +60,68 @@ def _resume_session_id(argv: list[str]) -> str | None:
         if token == "--resume" and index + 1 < len(argv) and _SESSION_ID.fullmatch(argv[index + 1]):
             return argv[index + 1]
     return None
+
+
+def _tui_session_id(argv: list[str]) -> str | None:
+    for index, token in enumerate(argv):
+        if (
+            token in {"--session-id", "--resume"}
+            and index + 1 < len(argv)
+            and _SESSION_ID.fullmatch(argv[index + 1])
+        ):
+            return argv[index + 1]
+    return None
+
+
+def _write_provider_runtime_metadata(
+    *,
+    tmux_state_path: Path,
+    tmux_session: str,
+    config_dir: Path,
+    session_id: str,
+) -> Path:
+    """Publish the non-secret Claude transcript root to the Telegram adapter."""
+    if not _TMUX_SESSION.fullmatch(tmux_session):
+        raise ValueError("tmux session name is invalid")
+    if not _SESSION_ID.fullmatch(session_id):
+        raise ValueError("Claude session id is invalid")
+    if not config_dir.is_absolute() or config_dir == Path("/") or ".." in config_dir.parts:
+        raise ValueError("Claude config directory is invalid")
+
+    sessions_root = tmux_state_path.parent.resolve(strict=True)
+    lexical_session_dir = sessions_root / tmux_session
+    if lexical_session_dir.is_symlink():
+        raise ValueError("tmux session directory must not be a symlink")
+    session_dir = lexical_session_dir.resolve(strict=True)
+    if session_dir.parent != sessions_root or not session_dir.is_dir():
+        raise ValueError("tmux session directory is outside the configured sessions root")
+
+    payload = {
+        "schema_version": 1,
+        "provider": "claude_code",
+        "session_id": session_id,
+        "config_dir": str(config_dir),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+    target = session_dir / _PROVIDER_RUNTIME_METADATA
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=session_dir)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        os.chmod(target, 0o600)
+        directory_fd = os.open(session_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
 
 
 def _rewrite_model(argv: list[str], model: str) -> list[str]:
@@ -117,6 +183,15 @@ def run(argv: list[str]) -> int:
     config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(config_dir, 0o700)
     model = str(spec["model"])
+    session_id = _tui_session_id(argv)
+    if session_id is None:
+        raise ValueError("Claude TUI launch requires --session-id or --resume")
+    _write_provider_runtime_metadata(
+        tmux_state_path=config.tmux_state_path,
+        tmux_session=session,
+        config_dir=config_dir,
+        session_id=session_id,
+    )
     environment = dict(os.environ)
     environment.update(
         {

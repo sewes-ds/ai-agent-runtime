@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import uuid
 from pathlib import Path
 
 import pytest
 
-from ai_agent_runtime.claude_wrapper.main import _config_path, _rewrite_model
+from ai_agent_runtime.claude_wrapper.main import (
+    _config_path,
+    _rewrite_model,
+    _tui_session_id,
+    _write_provider_runtime_metadata,
+)
 from ai_agent_runtime.config import RuntimeConfig
 from ai_agent_runtime.daemon.server import RuntimeServer
 from ai_agent_runtime.domain import DesiredSpec
@@ -56,6 +62,44 @@ def test_claude_wrapper_finds_instance_config_from_both_stable_path_shapes(
     expected = Path.home() / ".config/ai-agent-runtime/instances/ta_prod_01.toml"
     assert _config_path("/safe/bin/claude-wrapper@ta_prod_01") == expected
     assert _config_path("/safe/instances/ta_prod_01/bin/claude-wrapper") == expected
+
+
+def test_claude_wrapper_publishes_private_runtime_metadata(tmp_path: Path) -> None:
+    session_id = str(uuid.uuid4())
+    sessions = tmp_path / "tmux_sessions"
+    session_dir = sessions / "cc-n1001-42"
+    session_dir.mkdir(parents=True)
+    config_dir = tmp_path / "claude-config" / "deepseek_default"
+
+    path = _write_provider_runtime_metadata(
+        tmux_state_path=sessions / "state.json",
+        tmux_session="cc-n1001-42",
+        config_dir=config_dir,
+        session_id=session_id,
+    )
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "provider": "claude_code",
+        "session_id": session_id,
+        "config_dir": str(config_dir),
+    }
+    assert _tui_session_id(["--session-id", session_id]) == session_id
+    assert _tui_session_id(["--resume", session_id]) == session_id
+
+
+def test_claude_wrapper_rejects_metadata_path_escape(tmp_path: Path) -> None:
+    sessions = tmp_path / "tmux_sessions"
+    sessions.mkdir()
+
+    with pytest.raises(ValueError, match="tmux session name"):
+        _write_provider_runtime_metadata(
+            tmux_state_path=sessions / "state.json",
+            tmux_session="../escape",
+            config_dir=tmp_path / "claude-config",
+            session_id=str(uuid.uuid4()),
+        )
 
 
 def test_apply_binding_projects_claude_provider_to_upstream_engine(tmp_path: Path) -> None:
