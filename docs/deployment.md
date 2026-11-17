@@ -8,6 +8,7 @@ For an AgentInstance named `agent_01`:
 - Runtime config:
   `~/.config/ai-agent-runtime/instances/agent_01.toml`;
 - Runtime service: `ai-agent-runtime@agent_01.service`;
+- tmux session host: `ai-agent-tmux@agent_01.service`;
 - Runtime executable name: `~/.local/bin/ai-agent-runtime@agent_01`;
 - socket: `/run/user/$UID/ai-agent-runtime/agent_01/runtime.sock`;
 - wrapper executable name: `~/.local/bin/codex-wrapper@agent_01`;
@@ -25,6 +26,16 @@ actual service is enabled, its exact paths, user ownership, forum-chat uniquenes
 upstream release tuple, staging evidence, and rollback manifest must be validated.
 The production Telegram Agent drop-in must retain `KillMode=process` so its restart
 does not recursively destroy qualified tmux/wrapper/Codex processes.
+
+Run the per-instance tmux server in `ai-agent-tmux@agent_01.service`, and order the
+Telegram Agent after that unit. This keeps the bot control process outside the cgroup
+that contains tmux panes and provider descendants. The supplied tmux unit runs the
+server in the foreground with `tmux -D`, preserves the instance socket directory,
+and gives the session cgroup `OOMScoreAdjust=800`. Under global memory exhaustion,
+provider work is therefore eligible for reclamation before the Telegram and Runtime
+control planes. Do not activate the separate tmux host by killing or replacing a
+live upstream-owned server; migrate at a verified idle boundary or attach the live
+tree to a reviewed transient scope first.
 
 Keep the Telegram bot token and instance-specific dispatch configuration in a
 service-owned file outside every source checkout, for example

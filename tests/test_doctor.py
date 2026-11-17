@@ -124,6 +124,20 @@ def _fixture(tmp_path: Path) -> tuple[RuntimeConfig, socket.socket]:
 @pytest.mark.asyncio
 async def test_doctor_proves_local_runtime_inputs_without_mutation(tmp_path: Path) -> None:
     config, listener = _fixture(tmp_path)
+    store = RuntimeStore(config.database_path)
+    store.record_instance(
+        instance_id="failed-instance",
+        binding_id="binding-1",
+        wrapper_pid=300,
+        wrapper_starttime=400,
+        child_pid=None,
+        child_starttime=None,
+        tmux_session="failed-session-without-live-state",
+        tmux_pane="%2",
+        lifecycle=LifecycleState.START_FAILED,
+        applied_digest=None,
+    )
+    store.close()
 
     async def status(_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         assert payload["action"] == "status"

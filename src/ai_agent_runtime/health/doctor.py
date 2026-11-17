@@ -207,7 +207,7 @@ def _check_correlation(config: RuntimeConfig) -> str:
             """
             SELECT binding_id, tmux_session, lifecycle, launch_spec_json
             FROM instances
-            WHERE lifecycle NOT IN ('EXITED', 'RETIRED_FOR_RESTART')
+            WHERE lifecycle IN ('PROVISIONAL_STARTING', 'IDLE', 'BUSY', 'PENDING_CHANGE')
             """
         ).fetchall()
     finally:

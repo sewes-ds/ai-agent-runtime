@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Agent tmux session host for AgentInstance %i
+After=local-fs.target
+
+[Service]
+Type=simple
+Environment=TMUX_TMPDIR=%t/ai-agent-runtime/%i/tmux
+RuntimeDirectory=ai-agent-runtime/%i/tmux
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/tmux -D
+Restart=always
+RestartSec=2s
+# Provider processes are intentionally more disposable than the Telegram and
+# Runtime control planes when the host reaches global memory exhaustion.
+OOMScoreAdjust=800
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target

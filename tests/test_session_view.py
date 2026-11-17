@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,6 +12,7 @@ from ai_agent_runtime.daemon.server import RuntimeServer
 from ai_agent_runtime.domain import DesiredSpec, RuntimeBinding
 from ai_agent_runtime.telegram_upstream.session_view import (
     SessionViewError,
+    SessionViewResult,
     project_session_transcripts,
 )
 
@@ -274,3 +278,93 @@ def test_daemon_session_view_ignores_non_codex_provider_profiles(tmp_path: Path)
     assert list(view.iterdir()) == []
     assert server._status("request-1")["status"]["session_view"]["error"] is None
     server.store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_view_refresh_with_no_profiles_clears_pending(tmp_path: Path) -> None:
+    view = tmp_path / "view"
+    view.mkdir(mode=0o700)
+    config = RuntimeConfig(
+        agent_instance_id="agent-1",
+        forum_chat_id=-1001,
+        state_dir=tmp_path / "state",
+        socket_path=tmp_path / "run" / "runtime.sock",
+        database_path=tmp_path / "state" / "runtime.sqlite",
+        real_codex=tmp_path / "codex-real",
+        real_codex_version="test",
+        real_codex_sha256="sha256:" + "0" * 64,
+        profiles_root=tmp_path / "profiles",
+        topic_config_path=tmp_path / "topics.json",
+        tmux_state_path=tmp_path / "tmux-state.json",
+        upstream_sha="0" * 40,
+        sessions_view_root=view,
+        allowed_project_roots=(tmp_path,),
+    )
+    config.validate()
+    server = RuntimeServer(config)
+
+    await server._project_session_view()
+
+    assert server._status("request-1")["status"]["session_view"]["error"] is None
+    server.store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_view_refresh_does_not_block_runtime_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    view = tmp_path / "view"
+    view.mkdir(mode=0o700)
+    config = RuntimeConfig(
+        agent_instance_id="agent-1",
+        forum_chat_id=-1001,
+        state_dir=tmp_path / "state",
+        socket_path=tmp_path / "run" / "runtime.sock",
+        database_path=tmp_path / "state" / "runtime.sqlite",
+        real_codex=tmp_path / "codex-real",
+        real_codex_version="test",
+        real_codex_sha256="sha256:" + "0" * 64,
+        profiles_root=tmp_path / "profiles",
+        topic_config_path=tmp_path / "topics.json",
+        tmux_state_path=tmp_path / "tmux-state.json",
+        upstream_sha="0" * 40,
+        sessions_view_root=view,
+        allowed_project_roots=(tmp_path,),
+    )
+    config.validate()
+    server = RuntimeServer(config)
+    release = threading.Event()
+    event_loop_thread = threading.get_ident()
+
+    def profiles() -> dict[str, Path]:
+        assert threading.get_ident() == event_loop_thread
+        return {"work": tmp_path / "profiles" / "work"}
+
+    def slow_projection(*, profiles: dict[str, Path], view_root: Path) -> SessionViewResult:
+        assert threading.get_ident() != event_loop_thread
+        assert profiles == {"work": tmp_path / "profiles" / "work"}
+        assert view_root == view
+        release.wait(timeout=1.0)
+        return SessionViewResult(sources=0, added=0, existing=0)
+
+    monkeypatch.setattr(server, "_session_view_profiles", profiles)
+    monkeypatch.setattr(
+        "ai_agent_runtime.daemon.server.project_session_transcripts", slow_projection
+    )
+    timer = threading.Timer(0.25, release.set)
+    timer.start()
+    task = asyncio.create_task(server._session_view_loop())
+    started = time.monotonic()
+    try:
+        await asyncio.sleep(0.02)
+        assert time.monotonic() - started < 0.15
+        assert (
+            server._status("request-1")["status"]["session_view"]["error"] == "projection pending"
+        )
+    finally:
+        release.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        timer.cancel()
+        server.store.close()

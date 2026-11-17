@@ -150,6 +150,9 @@ def _verify_legacy_process_evidence(
 _PEERCRED = struct.Struct("3i")
 logger = logging.getLogger(__name__)
 
+_SESSION_VIEW_REFRESH_SECONDS = 5.0
+_SESSION_VIEW_PENDING = "projection pending"
+
 
 def _prepare_runtime_socket(path: Path) -> None:
     """Create a private socket directory and remove only an owned stale socket."""
@@ -219,7 +222,10 @@ class RuntimeServer:
         self.retirement_executor = retirement_executor
         self.evidence_interval = evidence_interval
         self._results: OrderedDict[str, tuple[str, dict[str, Any]]] = OrderedDict()
-        self._session_view_error: str | None = None
+        self._session_view_error: str | None = (
+            _SESSION_VIEW_PENDING if config.sessions_view_root is not None else None
+        )
+        self._session_view_lock = asyncio.Lock()
         self._rollout_observer_faults: set[str] = set()
 
     def _profile_reference(self, spec: DesiredSpec) -> tuple[Path, str]:
@@ -238,7 +244,6 @@ class RuntimeServer:
 
     async def serve(self) -> None:
         self._refresh_effective_profile_attestations_once()
-        self._project_session_view_once()
         _prepare_runtime_socket(self.config.socket_path)
         server = await asyncio.start_unix_server(self._handle, path=self.config.socket_path)
         os.chmod(self.config.socket_path, 0o600)
@@ -360,7 +365,7 @@ class RuntimeServer:
                 return
             action = _required_str(payload, "action")
             if action == "register":
-                response = self._register(request_id, payload, peer_pid, peer_uid)
+                response = await self._register(request_id, payload, peer_pid, peer_uid)
             elif action == "verify_started":
                 response = await self._verify_started(request_id, payload, peer_pid, peer_uid)
             elif action == "child_exited":
@@ -440,7 +445,7 @@ class RuntimeServer:
             raise RuntimeFailureError(ErrorCode.INVALID_REQUEST, "Unix peer UID mismatch")
         return _pid, uid
 
-    def _register(
+    async def _register(
         self,
         request_id: str,
         payload: dict[str, Any],
@@ -531,7 +536,7 @@ class RuntimeServer:
                 )
             safe_profile = validate_profile_path(codex_home, root=self.config.profiles_root)
             try:
-                self._project_session_view_once()
+                await self._project_session_view()
             except (OSError, ValueError, SessionViewError) as exc:
                 self._session_view_error = f"{type(exc).__name__}: {exc}"
                 raise RuntimeFailureError(
@@ -1875,10 +1880,9 @@ class RuntimeServer:
             lifecycle=state.lifecycle,
         )
 
-    def _project_session_view_once(self) -> None:
-        view_root = self.config.sessions_view_root
-        if view_root is None:
-            return
+    def _session_view_profiles(self) -> dict[str, Path]:
+        """Read the effective profile set on the Runtime event-loop thread."""
+
         profiles: dict[str, Path] = {}
         for binding in self.store.list_bindings(self.config.agent_instance_id):
             if not binding.configured:
@@ -1893,22 +1897,62 @@ class RuntimeServer:
             if home.name != spec.account_profile:
                 raise SessionViewError("effective account profile identity mismatch")
             profiles[spec.account_profile] = home
+        return profiles
+
+    def _project_session_view_once(self) -> None:
+        view_root = self.config.sessions_view_root
+        if view_root is None:
+            return
+        profiles = self._session_view_profiles()
         if profiles:
             result = project_session_transcripts(profiles=profiles, view_root=view_root)
             if result.removed:
                 logger.info("Pruned %d archived transcript links from session view", result.removed)
         self._session_view_error = None
 
+    async def _project_session_view(self) -> None:
+        """Refresh the filesystem view without blocking IPC or watchdog pings."""
+
+        async with self._session_view_lock:
+            view_root = self.config.sessions_view_root
+            if view_root is None:
+                return
+            # RuntimeStore owns a thread-affine SQLite connection. Resolve the
+            # small profile set on the event-loop thread, then offload only the
+            # bounded filesystem projection.
+            profiles = self._session_view_profiles()
+            if not profiles:
+                self._session_view_error = None
+                return
+            projection = asyncio.create_task(
+                asyncio.to_thread(
+                    project_session_transcripts,
+                    profiles=profiles,
+                    view_root=view_root,
+                )
+            )
+            try:
+                result = await asyncio.shield(projection)
+            except asyncio.CancelledError:
+                # A worker thread cannot be cancelled. Wait for its bounded
+                # filesystem transaction so a restarted daemon never projects
+                # the same view concurrently with the old process.
+                await projection
+                raise
+            if result.removed:
+                logger.info("Pruned %d archived transcript links from session view", result.removed)
+            self._session_view_error = None
+
     async def _session_view_loop(self) -> None:
         while True:
             try:
-                self._project_session_view_once()
+                await self._project_session_view()
             except (OSError, ValueError, SessionViewError) as exc:
                 detail = f"{type(exc).__name__}: {exc}"
                 if detail != self._session_view_error:
                     logger.error("Transcript projection failed: %s", detail)
                 self._session_view_error = detail
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(_SESSION_VIEW_REFRESH_SECONDS)
 
     def _child_exited(
         self,

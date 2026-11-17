@@ -57,9 +57,7 @@ def _install_report(tmp_path: Path) -> tuple[Path, Path, Path]:
             "python_path": "/usr/bin/python3.12",
             "runtime_executable": str(runtime),
             "wrapper_executable": str(wrapper),
-            "qualification_executables": {
-                name: str(path) for name, path in qualification.items()
-            },
+            "qualification_executables": {name: str(path) for name, path in qualification.items()},
             "installed_files": installed_files,
             "installed_files_digest": _digest(installed_files),
             "existing_releases_preserved": True,
@@ -317,10 +315,24 @@ def test_deployment_audit_requires_tmux_socket_survival_across_full_stop(
 
 def test_runtime_unit_preserves_tmux_socket_on_full_stop() -> None:
     unit = (
-        Path(__file__).resolve().parents[1]
-        / "deploy/systemd/ai-agent-runtime@.service"
+        Path(__file__).resolve().parents[1] / "deploy/systemd/ai-agent-runtime@.service"
     ).read_text(encoding="utf-8")
     assert "RuntimeDirectoryPreserve=yes" in unit
+
+
+def test_tmux_session_host_isolated_from_telegram_control_plane() -> None:
+    root = Path(__file__).resolve().parents[1]
+    tmux_unit = (root / "deploy/systemd/ai-agent-tmux@.service").read_text(encoding="utf-8")
+    telegram_drop_in = (root / "deploy/systemd/telegram-ai-agent-runtime.conf").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ExecStart=/usr/bin/tmux -D" in tmux_unit
+    assert "OOMScoreAdjust=800" in tmux_unit
+    assert "RuntimeDirectoryPreserve=yes" in tmux_unit
+    assert "Requires=ai-agent-tmux@agent_01.service" in telegram_drop_in
+    assert "After=ai-agent-tmux@agent_01.service" in telegram_drop_in
+    assert "KillMode=process" in telegram_drop_in
 
 
 def test_deployment_audit_blocks_unqualified_release(tmp_path: Path) -> None:

@@ -218,7 +218,7 @@ async def test_clear_waits_for_new_upstream_state(
         "tmux_session": tmux_name,
         "tmux_pane": "%1",
     }
-    registration = daemon._register(
+    registration = await daemon._register(
         str(uuid.uuid4()),
         {"agent_instance_id": "agent-1", "resume_session_id": None, **identity},
         pid,
@@ -286,7 +286,10 @@ async def test_clear_waits_for_new_upstream_state(
 
 
 @pytest.mark.usefixtures("allow_hosted_runner_python")
-def test_resume_requires_same_binding_even_with_same_cwd_and_account(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_requires_same_binding_even_with_same_cwd_and_account(
+    tmp_path: Path,
+) -> None:
     project = tmp_path / "project"
     project.mkdir(mode=0o700)
     profile = tmp_path / "profiles" / "work"
@@ -371,7 +374,7 @@ def test_resume_requires_same_binding_even_with_same_cwd_and_account(tmp_path: P
             "cwd": str(project),
             "tmux_pane": "%1",
         }
-        allowed = daemon._register(
+        allowed = await daemon._register(
             str(uuid.uuid4()),
             {
                 "agent_instance_id": "agent-1",
@@ -385,7 +388,7 @@ def test_resume_requires_same_binding_even_with_same_cwd_and_account(tmp_path: P
         assert allowed["binding_id"] == "binding-42"
 
         with pytest.raises(RuntimeFailureError) as rejected:
-            daemon._register(
+            await daemon._register(
                 str(uuid.uuid4()),
                 {
                     "agent_instance_id": "agent-1",
